@@ -89,33 +89,117 @@ async def unsubscribe_get(
     session: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
     """Handle one-click unsubscribe links from delivered emails."""
-    service = SubscriberService(session=session)
-    success = await service.unsubscribe(token=token, email=email)
-    
-    status_text = (
-        "You have been successfully unsubscribed."
-        if success
-        else "Subscription not found or already inactive."
-    )
-    
+    clean_token = token.strip() if token else None
+    clean_email = email.strip() if email else None
+
+    success = False
+    if clean_token or clean_email:
+        service = SubscriberService(session=session)
+        success = await service.unsubscribe(token=clean_token, email=clean_email)
+
+    home_url = settings.NEWSLETTER_BASE_URL or "http://127.0.0.1:5500"
+
+    if success:
+        page_title = "Unsubscribed — AI News Daily"
+        badge_color = "#38bdf8"
+        badge_bg = "rgba(56, 189, 248, 0.12)"
+        icon_svg = """<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>"""
+        heading = "You have been unsubscribed from AI News Daily."
+        body_text = "Your subscription has been deactivated. You will no longer receive daily digests at this email address. If this was a mistake, you can re-subscribe at any time."
+    else:
+        page_title = "Subscription Notice — AI News Daily"
+        badge_color = "#f59e0b"
+        badge_bg = "rgba(245, 158, 11, 0.12)"
+        icon_svg = """<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>"""
+        heading = "That unsubscribe link is invalid or has already been used."
+        body_text = "We could not find an active subscription for this link. If you have already unsubscribed, no further action is required."
+
     html = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Unsubscribed — AI News</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{page_title}</title>
   <style>
-    body {{ background: #0b0f19; color: #f8fafc; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-    .card {{ background: #0f172a; border: 1px solid #1e293b; padding: 40px; border-radius: 12px; max-width: 480px; text-align: center; }}
-    h1 {{ font-size: 22px; margin-bottom: 12px; color: #38bdf8; }}
-    p {{ color: #94a3b8; font-size: 14px; line-height: 1.6; }}
-    a {{ color: #38bdf8; text-decoration: none; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background-color: #0b0f19;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 48px 36px;
+      max-width: 520px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }}
+    .icon-container {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: {badge_bg};
+      margin-bottom: 24px;
+    }}
+    .brand {{
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: {badge_color};
+      margin-bottom: 12px;
+    }}
+    h1 {{
+      font-size: 22px;
+      font-weight: 700;
+      color: #f1f5f9;
+      line-height: 1.4;
+      margin-bottom: 16px;
+    }}
+    p {{
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 28px;
+    }}
+    .action-btn {{
+      display: inline-block;
+      background: #0284c7;
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 13px;
+      padding: 10px 24px;
+      border-radius: 8px;
+      transition: background 0.2s ease;
+    }}
+    .action-btn:hover {{
+      background: #0369a1;
+    }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>AI News Daily Digest</h1>
-    <p>{status_text}</p>
-    <p>We're sorry to see you go. You can re-subscribe at any time from our homepage.</p>
+    <div class="icon-container">
+      {icon_svg}
+    </div>
+    <div class="brand">AI News Intelligence • Daily Digest</div>
+    <h1>{heading}</h1>
+    <p>{body_text}</p>
+    <div>
+      <a href="{home_url}" class="action-btn">Return to Homepage &rarr;</a>
+    </div>
   </div>
 </body>
 </html>"""

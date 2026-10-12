@@ -207,7 +207,7 @@ class DeliveryService:
 
             # Personalize links
             unsubscribe_link = (
-                f"{settings.NEWSLETTER_BASE_URL}/api/v1/newsletter/unsubscribe?token={sub.unsubscribe_token}"
+                f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={sub.unsubscribe_token}"
             )
             preferences_link = f"{settings.NEWSLETTER_BASE_URL}#customize-newsletter"
 

@@ -112,9 +112,9 @@ class SubscriberRepository(BaseRepository[Subscriber]):
         return subscriber
 
     async def deactivate_by_token(self, token: str) -> Optional[Subscriber]:
-        """Deactivate subscriber via secure unsubscribe token."""
+        """Deactivate subscriber via secure unsubscribe token. Returns None if not found or already inactive."""
         subscriber = await self.get_by_token(token)
-        if not subscriber:
+        if not subscriber or not subscriber.is_active:
             return None
 
         subscriber.is_active = False
@@ -124,9 +124,9 @@ class SubscriberRepository(BaseRepository[Subscriber]):
         return subscriber
 
     async def deactivate_by_email(self, email: str) -> Optional[Subscriber]:
-        """Deactivate subscriber by email address."""
+        """Deactivate subscriber by email address. Returns None if not found or already inactive."""
         subscriber = await self.get_by_email(email)
-        if not subscriber:
+        if not subscriber or not subscriber.is_active:
             return None
 
         subscriber.is_active = False
