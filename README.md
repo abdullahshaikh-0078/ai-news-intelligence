@@ -219,7 +219,7 @@ GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 GEMINI_EMBEDDING_DIMENSIONS=1536
 RESEND_API_KEY=re_your_resend_api_key
 RESEND_WEBHOOK_SECRET=whsec_your_webhook_secret
-CORS_ORIGINS=["http://localhost:5500","http://127.0.0.1:5500","https://your-portfolio.vercel.app"]
+CORS_ORIGINS=["http://localhost:5500","http://127.0.0.1:5500","https://abdullah-shaikh-portfolio.vercel.app","https://abdullah-ai-systems-portfolio.vercel.app"]
 ```
 
 ### 3. Database Migrations

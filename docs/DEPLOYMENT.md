@@ -89,7 +89,7 @@ Set the following environment variables in your hosting provider's dashboard:
 | `RESEND_WEBHOOK_SECRET` | Resend Svix webhook key | `whsec_...` |
 | `EMAIL_FROM` | Verified sender email | `AI News <newsletter@yourdomain.com>` |
 | `NEWSLETTER_BASE_URL` | Public site domain | `https://abdullahshaikh.dev` |
-| `CORS_ORIGINS` | Allowed portfolio origins | `["https://abdullahshaikh.dev","https://your-portfolio.vercel.app"]` |
+| `CORS_ORIGINS` | Allowed portfolio origins | `["https://abdullah-shaikh-portfolio.vercel.app","https://abdullah-ai-systems-portfolio.vercel.app"]` |
 | `DISPATCH_SECRET_TOKEN` | Optional auth token for cron | `your_secure_random_dispatch_token` |
 
 ### Health Checks & Probes:

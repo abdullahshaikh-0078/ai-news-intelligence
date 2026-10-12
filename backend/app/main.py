@@ -28,6 +28,7 @@ from app.infrastructure.database.session import engine
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown routines."""
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION} [{settings.ENVIRONMENT}]")
+    logger.info(f"Configured CORS origins: {settings.CORS_ORIGINS}")
     yield
     logger.info(f"Shutting down {settings.APP_NAME} and disposing database connection pool")
     await engine.dispose()

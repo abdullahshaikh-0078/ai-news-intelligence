@@ -19,10 +19,26 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
     API_V1_STR: str = "/api/v1"
+    API_BASE_URL: str = "http://127.0.0.1:8000"
+
+    @property
+    def public_api_v1_url(self) -> str:
+        """Canonical public backend API base URL with /api/v1 prefix."""
+        base = self.API_BASE_URL.rstrip("/")
+        if base.endswith("/api/v1"):
+            return base
+        api_prefix = self.API_V1_STR.strip("/")
+        return f"{base}/{api_prefix}"
 
     # Server binding
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    # Production frontend origins guaranteed to be allowed
+    PRODUCTION_ORIGINS: List[str] = [
+        "https://abdullah-shaikh-portfolio.vercel.app",
+        "https://abdullah-ai-systems-portfolio.vercel.app",
+    ]
 
     # CORS configuration
     CORS_ORIGINS: List[str] = [
@@ -34,21 +50,41 @@ class Settings(BaseSettings):
         "http://127.0.0.1:8080",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://abdullah-shaikh-portfolio.vercel.app",
+        "https://abdullah-ai-systems-portfolio.vercel.app",
     ]
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        origins: List[str] = []
         if isinstance(v, str):
             if v.startswith("[") and v.endswith("]"):
                 try:
-                    return json.loads(v)
+                    origins = json.loads(v)
                 except Exception:
-                    pass
-            return [i.strip() for i in v.split(",") if i.strip()]
+                    origins = []
+            else:
+                origins = [i.strip() for i in v.split(",") if i.strip()]
         elif isinstance(v, list):
-            return v
-        return []
+            origins = list(v)
+
+        canonical_production = [
+            "https://abdullah-shaikh-portfolio.vercel.app",
+            "https://abdullah-ai-systems-portfolio.vercel.app",
+        ]
+        cleaned: List[str] = []
+        for origin in origins:
+            if isinstance(origin, str) and origin.strip():
+                normalized = origin.strip().rstrip("/")
+                if normalized and normalized not in cleaned:
+                    cleaned.append(normalized)
+
+        for prod in canonical_production:
+            if prod not in cleaned:
+                cleaned.append(prod)
+
+        return cleaned
 
     # Canonical Database Configuration (Single Source of Truth)
     DATABASE_URL: str = "postgresql+asyncpg://postgres@localhost:5433/ai_news_intel"
