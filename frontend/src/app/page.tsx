@@ -33,6 +33,7 @@ interface ReadinessData {
 }
 
 export default function Home() {
+  const backendUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
   const [health, setHealth] = useState<HealthData | null>(null);
   const [ready, setReady] = useState<ReadinessData | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -42,7 +43,6 @@ export default function Home() {
     setLoading(true);
     setError(null);
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
       const [healthRes, readyRes] = await Promise.all([
         fetch(`${backendUrl}/health`),
         fetch(`${backendUrl}/ready`),
@@ -92,7 +92,7 @@ export default function Home() {
 
           <div className="flex items-center gap-4">
             <a
-              href="http://localhost:8000/docs"
+              href={`${backendUrl}/docs`}
               target="_blank"
               rel="noreferrer"
               className="text-xs text-gray-400 hover:text-white flex items-center gap-1.5 transition-colors"
