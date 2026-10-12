@@ -12,9 +12,11 @@ from app.domain.models.newsletter import (
     DigestSendResponse,
     DigestStoryItem,
 )
+from app.core.config import settings
 from app.infrastructure.database.session import get_db
 from app.infrastructure.models.digest import Digest
 from app.infrastructure.repositories.digest_repo import DigestRepository
+from app.infrastructure.repositories.subscriber_repo import SubscriberRepository
 from app.services.digest_service import DigestService
 from app.services.email_service import DeliveryService
 
@@ -132,6 +134,7 @@ async def get_digest_by_id(
 )
 async def preview_digest_html(
     digest_id: uuid.UUID,
+    token: Optional[str] = Query(None, description="Optional subscriber token for personalized preview"),
     session: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
     """Return responsive HTML newsletter template for browser/iframe preview."""
@@ -142,10 +145,21 @@ async def preview_digest_html(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Digest issue {digest_id} not found.",
         )
-    # Render with sample links for preview
+
+    sub_token = "preview-placeholder-token"
+    if token:
+        subscriber_repo = SubscriberRepository(session)
+        subscriber = await subscriber_repo.get_by_token(token.strip())
+        if subscriber and subscriber.is_active:
+            sub_token = subscriber.unsubscribe_token
+
+    preview_unsub = f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={sub_token}"
+    preview_pref = f"{settings.NEWSLETTER_BASE_URL}#customize-newsletter"
+
+    # Render with preview links
     preview_html = (
-        digest.html_content.replace("{{ unsubscribe_url }}", "#preview-unsubscribe")
-        .replace("{{ preferences_url }}", "#preview-preferences")
+        digest.html_content.replace("{{ unsubscribe_url }}", preview_unsub)
+        .replace("{{ preferences_url }}", preview_pref)
     )
     return HTMLResponse(content=preview_html)
 
