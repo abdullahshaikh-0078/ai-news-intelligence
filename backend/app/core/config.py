@@ -36,12 +36,23 @@ class Settings(BaseSettings):
         return f"{base}/{api_prefix}"
 
     @property
+    def is_production_like(self) -> bool:
+        """Return True if the runtime environment is production, staging, or hosted on Render."""
+        import os
+        return (
+            self.ENVIRONMENT in ("production", "staging")
+            or bool(os.environ.get("RENDER"))
+            or bool(os.environ.get("RENDER_EXTERNAL_URL"))
+            or bool(os.environ.get("RENDER_SERVICE_ID"))
+        )
+
+    @property
     def effective_newsletter_base_url(self) -> str:
         """Effective frontend portfolio URL for newsletter action and preference links."""
         import os
         if self.NEWSLETTER_BASE_URL and "127.0.0.1" not in self.NEWSLETTER_BASE_URL and "localhost" not in self.NEWSLETTER_BASE_URL:
             return self.NEWSLETTER_BASE_URL
-        if self.ENVIRONMENT in ("production", "staging") or os.environ.get("RENDER"):
+        if self.is_production_like:
             return "https://abdullah-shaikh-portfolio.vercel.app"
         return self.NEWSLETTER_BASE_URL
 

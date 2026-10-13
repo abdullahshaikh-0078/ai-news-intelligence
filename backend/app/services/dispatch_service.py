@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from datetime import date, datetime, timezone
+import sys
 import time
 from typing import Any, Dict, Optional
 import uuid
@@ -73,6 +74,7 @@ class DailyDispatchService:
                 )
                 source_service = SourceService(source_repo)
                 await source_service.seed_default_sources()
+                await self.session.commit()
 
         # -----------------------------------------------------------------
         # Stage 1: Pipeline Pass (Ingestion, AI analysis, Embeddings, Ranking, Curation)
@@ -187,6 +189,8 @@ async def _run_cli():
         print(f"Digest ID: {res.digest_id} ({res.digest_stories_count} stories)")
         print(f"Subscribers: total={res.total_subscribers}, sent={res.sent_count}, skipped={res.skipped_count}, failed={res.failed_count}")
         print(f"Duration: {res.duration_seconds}s")
+        if res.status == "error":
+            sys.exit(1)
 
 
 if __name__ == "__main__":

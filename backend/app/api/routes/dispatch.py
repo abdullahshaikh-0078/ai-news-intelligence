@@ -1,3 +1,4 @@
+import hmac
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -25,7 +26,7 @@ def verify_dispatch_auth(
     """Validate dispatch trigger authorization if DISPATCH_SECRET_TOKEN is configured."""
     secret_token = (settings.DISPATCH_SECRET_TOKEN or "").strip()
     if not secret_token:
-        if settings.ENVIRONMENT in ("production", "staging"):
+        if settings.is_production_like:
             logger.error(
                 "Dispatch execution rejected: DISPATCH_SECRET_TOKEN is not configured in production/staging environment."
             )
@@ -41,7 +42,7 @@ def verify_dispatch_auth(
     elif isinstance(x_dispatch_token, str):
         token = x_dispatch_token.strip()
 
-    if not token or token != secret_token:
+    if not token or not hmac.compare_digest(token, secret_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: invalid or missing dispatch authorization token",

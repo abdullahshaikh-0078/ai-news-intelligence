@@ -24,6 +24,24 @@ from app.api.routes.dispatch import router as dispatch_router
 from app.infrastructure.database.session import engine
 
 
+async def init_source_registry() -> list:
+    """Idempotently initialize and persist verified default sources on startup."""
+    from app.infrastructure.database.session import AsyncSessionLocal
+    from app.infrastructure.repositories.source_repo import SourceRepository
+    from app.services.source_service import SourceService
+
+    async with AsyncSessionLocal() as session:
+        try:
+            source_repo = SourceRepository(session)
+            source_service = SourceService(source_repo)
+            seeded = await source_service.seed_default_sources()
+            await session.commit()
+            return seeded
+        except Exception:
+            await session.rollback()
+            raise
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown routines."""
@@ -32,15 +50,8 @@ async def lifespan(app: FastAPI):
 
     # Idempotent source registry initialization on startup
     try:
-        from app.infrastructure.database.session import AsyncSessionLocal
-        from app.infrastructure.repositories.source_repo import SourceRepository
-        from app.services.source_service import SourceService
-
-        async with AsyncSessionLocal() as session:
-            source_repo = SourceRepository(session)
-            source_service = SourceService(source_repo)
-            seeded = await source_service.seed_default_sources()
-            logger.info(f"Source registry initialized on startup: {len(seeded)} verified sources active")
+        seeded = await init_source_registry()
+        logger.info(f"Source registry initialized on startup: {len(seeded)} verified sources active")
     except Exception as exc:
         logger.error(
             f"Startup source registry initialization encountered non-fatal error: {exc.__class__.__name__}: {str(exc)}"

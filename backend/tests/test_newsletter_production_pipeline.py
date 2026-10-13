@@ -11,8 +11,10 @@ from app.domain.models.curation import CuratedStoryResponse
 from app.domain.models.dispatch import DailyDispatchRequest, DispatchStatusResponse
 from app.domain.models.source import SourceType
 from app.domain.schemas.source import SourceCreate
+from app.infrastructure.models.content_item import ContentItem
 from app.infrastructure.models.digest import DeliveryRecord, Digest, DigestStory
 from app.infrastructure.models.source import Source
+from app.infrastructure.models.story import Story
 from app.infrastructure.models.subscriber import Subscriber
 from app.infrastructure.repositories.digest_repo import DigestRepository
 from app.ingestion.orchestrator import IngestionOrchestrator
@@ -134,6 +136,47 @@ class TestSourceSeedingIdempotency:
         assert arxiv_again.config.get("max_results_per_page") == 99
         assert arxiv_again.reliability_score == 0.73
         assert arxiv_again.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_init_source_registry_persists_and_commits_transaction(self):
+        """Verify init_source_registry acquires session, seeds sources, and commits transaction."""
+        from app.main import init_source_registry
+
+        mock_session = AsyncMock()
+        mock_session_cls = MagicMock()
+        mock_session_ctx = MagicMock()
+        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_session_cls.return_value = mock_session_ctx
+
+        mock_seeded = [MagicMock(), MagicMock()]
+        with patch("app.infrastructure.database.session.AsyncSessionLocal", mock_session_cls):
+            with patch("app.services.source_service.SourceService.seed_default_sources", AsyncMock(return_value=mock_seeded)):
+                result = await init_source_registry()
+
+        assert result == mock_seeded
+        mock_session.commit.assert_awaited_once()
+        mock_session.rollback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_init_source_registry_rolls_back_on_exception(self):
+        """Verify init_source_registry cleanly rolls back transaction when an exception occurs."""
+        from app.main import init_source_registry
+
+        mock_session = AsyncMock()
+        mock_session_cls = MagicMock()
+        mock_session_ctx = MagicMock()
+        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_session_cls.return_value = mock_session_ctx
+
+        with patch("app.infrastructure.database.session.AsyncSessionLocal", mock_session_cls):
+            with patch("app.services.source_service.SourceService.seed_default_sources", AsyncMock(side_effect=RuntimeError("DB write failed"))):
+                with pytest.raises(RuntimeError, match="DB write failed"):
+                    await init_source_registry()
+
+        mock_session.commit.assert_not_called()
+        mock_session.rollback.assert_awaited_once()
 
 
 class TestIngestionOrchestratorAllSources:
@@ -784,6 +827,41 @@ class TestDispatchAuthentication:
                 verify_dispatch_auth(authorization="Basic my-secret-token")
             assert exc_info.value.status_code == 401
 
+    def test_verify_dispatch_auth_fails_closed_on_render_even_if_environment_is_development(self, monkeypatch):
+        """When DISPATCH_SECRET_TOKEN is unset on Render hosting, fail closed with HTTP 503 regardless of ENVIRONMENT setting."""
+        with patch.object(settings, "DISPATCH_SECRET_TOKEN", None):
+            with patch.object(settings, "ENVIRONMENT", "development"):
+                monkeypatch.setenv("RENDER", "true")
+                with pytest.raises(HTTPException) as exc_info:
+                    verify_dispatch_auth()
+                assert exc_info.value.status_code == 503
+                assert "DISPATCH_SECRET_TOKEN must be configured" in exc_info.value.detail
+
+    def test_verify_dispatch_auth_fails_closed_on_render_external_url(self, monkeypatch):
+        """When RENDER_EXTERNAL_URL is set and DISPATCH_SECRET_TOKEN is unset, fail closed with HTTP 503."""
+        with patch.object(settings, "DISPATCH_SECRET_TOKEN", None):
+            with patch.object(settings, "ENVIRONMENT", "development"):
+                monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://ai-news-intelligence-vvh5.onrender.com")
+                with pytest.raises(HTTPException) as exc_info:
+                    verify_dispatch_auth()
+                assert exc_info.value.status_code == 503
+
+    def test_verify_dispatch_auth_constant_time_comparison(self):
+        """Verify token comparison handles matching and non-matching tokens with constant-time defense."""
+        with patch.object(settings, "DISPATCH_SECRET_TOKEN", "constant-time-secret-key-12345"):
+            # Invalid token of different length
+            with pytest.raises(HTTPException) as exc_info:
+                verify_dispatch_auth(authorization="Bearer short")
+            assert exc_info.value.status_code == 401
+
+            # Invalid token of identical length
+            with pytest.raises(HTTPException) as exc_info:
+                verify_dispatch_auth(authorization="Bearer constant-time-secret-key-99999")
+            assert exc_info.value.status_code == 401
+
+            # Valid token passes
+            verify_dispatch_auth(authorization="Bearer constant-time-secret-key-12345")
+
 
 class TestSchedulerTimezoneAndURLConfiguration:
     """Test 9:00 AM IST to 03:30 UTC conversion and environment URL resolution."""
@@ -818,3 +896,271 @@ class TestSchedulerTimezoneAndURLConfiguration:
             with patch.object(settings, "NEWSLETTER_BASE_URL", "http://127.0.0.1:5500"):
                 url = settings.effective_newsletter_base_url
                 assert url == "https://abdullah-shaikh-portfolio.vercel.app"
+
+
+class TestSubscriberPreferenceEnforcement:
+    """Test subscriber channel filtering, topic personalization, and safe defaults."""
+
+    @pytest.mark.asyncio
+    async def test_non_email_preferred_channel_is_skipped(self):
+        """Subscriber with preferred_channel != 'EMAIL' (e.g. 'RSS', 'SLACK') is skipped from email delivery."""
+        mock_session = AsyncMock()
+        delivery_service = DeliveryService(session=mock_session)
+
+        digest_id = uuid.uuid4()
+        digest = Digest(
+            id=digest_id,
+            title="Daily Digest",
+            html_content="<p>Body</p>",
+            plain_text_content="Body",
+            story_count=1,
+            digest_stories=[],
+        )
+        subscriber_rss = Subscriber(
+            id=uuid.uuid4(),
+            email="rss-user@example.com",
+            is_active=True,
+            preferred_channel="RSS",
+            unsubscribe_token="token_rss",
+        )
+
+        delivery_service.digest_repo.get_with_stories = AsyncMock(return_value=digest)
+        delivery_service.subscriber_repo.list_active = AsyncMock(return_value=[subscriber_rss])
+        mock_provider = MagicMock()
+        mock_provider.send_email = AsyncMock()
+        delivery_service.email_provider = mock_provider
+
+        res = await delivery_service.send_digest(digest_id=digest_id)
+
+        assert res.total_subscribers == 1
+        assert res.sent_count == 0
+        assert res.skipped_count == 1
+        mock_provider.send_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_topic_preference_filters_stories_and_personalizes_digest(self):
+        """Subscriber with topic preferences receives only matching stories in their personalized email."""
+        mock_session = AsyncMock()
+        mock_session.add = MagicMock()
+        delivery_service = DeliveryService(session=mock_session)
+
+        digest_id = uuid.uuid4()
+        story_ml = Story(
+            id=uuid.uuid4(),
+            headline="Breakthrough in LLM Reasoning",
+            summary="New reasoning model outperforms baselines.",
+            why_it_matters="Accelerates agentic coding workflows.",
+            category="Machine Learning",
+            ranking_score=0.95,
+        )
+        story_bio = Story(
+            id=uuid.uuid4(),
+            headline="Biotech AI Protein Folding",
+            summary="New model maps cellular pathways.",
+            why_it_matters="Accelerates drug discovery.",
+            category="Biotech",
+            ranking_score=0.88,
+        )
+
+        ds_ml = DigestStory(
+            id=uuid.uuid4(),
+            digest_id=digest_id,
+            story_id=story_ml.id,
+            position=1,
+            headline_override=story_ml.headline,
+            summary_override=story_ml.summary,
+            why_it_matters_override=story_ml.why_it_matters,
+            ranking_score_snapshot=0.95,
+            story=story_ml,
+        )
+        ds_bio = DigestStory(
+            id=uuid.uuid4(),
+            digest_id=digest_id,
+            story_id=story_bio.id,
+            position=2,
+            headline_override=story_bio.headline,
+            summary_override=story_bio.summary,
+            why_it_matters_override=story_bio.why_it_matters,
+            ranking_score_snapshot=0.88,
+            story=story_bio,
+        )
+
+        digest = Digest(
+            id=digest_id,
+            title="Daily Digest",
+            digest_date=date(2026, 10, 13),
+            html_content="<p>Default All Stories</p>",
+            plain_text_content="Default All Stories",
+            story_count=2,
+            digest_stories=[ds_ml, ds_bio],
+        )
+
+        sub_ml = Subscriber(
+            id=uuid.uuid4(),
+            email="ml-fan@example.com",
+            is_active=True,
+            preferred_channel="EMAIL",
+            topics=["machine learning"],
+            unsubscribe_token="token_ml",
+        )
+
+        claim = DeliveryRecord(
+            id=uuid.uuid4(),
+            digest_id=digest_id,
+            subscriber_id=sub_ml.id,
+            status="PENDING",
+            metadata_json={"claim_token": "token-123"},
+        )
+
+        delivery_service.digest_repo.get_with_stories = AsyncMock(return_value=digest)
+        delivery_service.subscriber_repo.list_active = AsyncMock(return_value=[sub_ml])
+        delivery_service.digest_repo.claim_delivery = AsyncMock(return_value=claim)
+        delivery_service.digest_repo.complete_delivery = AsyncMock(return_value=True)
+
+        mock_provider = MagicMock()
+        mock_provider.send_email = AsyncMock(return_value=MagicMock(success=True, provider_message_id="msg_1"))
+        delivery_service.email_provider = mock_provider
+
+        res = await delivery_service.send_digest(digest_id=digest_id)
+
+        assert res.total_subscribers == 1
+        assert res.sent_count == 1
+        assert res.skipped_count == 0
+        mock_provider.send_email.assert_called_once()
+        sent_html = mock_provider.send_email.call_args.kwargs["html_content"]
+        assert "Breakthrough in LLM Reasoning" in sent_html
+        assert "Biotech AI Protein Folding" not in sent_html
+
+    @pytest.mark.asyncio
+    async def test_topic_preference_no_matches_safely_skipped(self):
+        """Subscriber whose topic preferences match 0 stories in today's digest is skipped with 0 emails sent."""
+        mock_session = AsyncMock()
+        delivery_service = DeliveryService(session=mock_session)
+
+        digest_id = uuid.uuid4()
+        story_ml = Story(
+            id=uuid.uuid4(),
+            headline="AI Systems Update",
+            category="Machine Learning",
+            ranking_score=0.9,
+        )
+        ds = DigestStory(
+            id=uuid.uuid4(),
+            digest_id=digest_id,
+            story_id=story_ml.id,
+            position=1,
+            headline_override=story_ml.headline,
+            ranking_score_snapshot=0.9,
+            story=story_ml,
+        )
+        digest = Digest(
+            id=digest_id,
+            title="Daily Digest",
+            story_count=1,
+            digest_stories=[ds],
+        )
+        sub_quantum = Subscriber(
+            id=uuid.uuid4(),
+            email="quantum@example.com",
+            is_active=True,
+            preferred_channel="EMAIL",
+            topics=["Quantum Computing"],
+            unsubscribe_token="token_q",
+        )
+
+        delivery_service.digest_repo.get_with_stories = AsyncMock(return_value=digest)
+        delivery_service.subscriber_repo.list_active = AsyncMock(return_value=[sub_quantum])
+        mock_provider = MagicMock()
+        mock_provider.send_email = AsyncMock()
+        delivery_service.email_provider = mock_provider
+
+        res = await delivery_service.send_digest(digest_id=digest_id)
+
+        assert res.total_subscribers == 1
+        assert res.sent_count == 0
+        assert res.skipped_count == 1
+        mock_provider.send_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_topics_receives_complete_digest(self):
+        """Subscriber with empty topics list receives all stories without filtering."""
+        mock_session = AsyncMock()
+        mock_session.add = MagicMock()
+        delivery_service = DeliveryService(session=mock_session)
+
+        digest_id = uuid.uuid4()
+        digest = Digest(
+            id=digest_id,
+            title="Daily Digest",
+            html_content="<p>Full General Digest</p>",
+            plain_text_content="Full General Digest",
+            story_count=3,
+            digest_stories=[],
+        )
+        sub_general = Subscriber(
+            id=uuid.uuid4(),
+            email="general@example.com",
+            is_active=True,
+            preferred_channel="EMAIL",
+            topics=[],
+            unsubscribe_token="token_gen",
+        )
+        claim = DeliveryRecord(
+            id=uuid.uuid4(),
+            digest_id=digest_id,
+            subscriber_id=sub_general.id,
+            status="PENDING",
+            metadata_json={"claim_token": "token-gen"},
+        )
+
+        delivery_service.digest_repo.get_with_stories = AsyncMock(return_value=digest)
+        delivery_service.subscriber_repo.list_active = AsyncMock(return_value=[sub_general])
+        delivery_service.digest_repo.claim_delivery = AsyncMock(return_value=claim)
+        delivery_service.digest_repo.complete_delivery = AsyncMock(return_value=True)
+
+        mock_provider = MagicMock()
+        mock_provider.send_email = AsyncMock(return_value=MagicMock(success=True, provider_message_id="msg_gen"))
+        delivery_service.email_provider = mock_provider
+
+        res = await delivery_service.send_digest(digest_id=digest_id)
+
+        assert res.total_subscribers == 1
+        assert res.sent_count == 1
+        mock_provider.send_email.assert_called_once()
+        sent_html = mock_provider.send_email.call_args.kwargs["html_content"]
+        assert "Full General Digest" in sent_html
+
+
+class TestEmptyDigestDeliveryGuard:
+    """Test protection against delivering blank newsletter issues."""
+
+    @pytest.mark.asyncio
+    async def test_digest_story_count_zero_skips_all_subscribers(self):
+        """When digest issue has 0 stories, send_digest immediately returns 0 sent and skips all subscribers."""
+        mock_session = AsyncMock()
+        delivery_service = DeliveryService(session=mock_session)
+
+        digest_id = uuid.uuid4()
+        digest = Digest(
+            id=digest_id,
+            title="Empty Digest",
+            html_content="<p>Empty</p>",
+            plain_text_content="Empty",
+            story_count=0,
+            digest_stories=[],
+        )
+        sub1 = Subscriber(id=uuid.uuid4(), email="sub1@example.com", is_active=True, unsubscribe_token="t1")
+        sub2 = Subscriber(id=uuid.uuid4(), email="sub2@example.com", is_active=True, unsubscribe_token="t2")
+
+        delivery_service.digest_repo.get_with_stories = AsyncMock(return_value=digest)
+        delivery_service.subscriber_repo.list_active = AsyncMock(return_value=[sub1, sub2])
+        mock_provider = MagicMock()
+        mock_provider.send_email = AsyncMock()
+        delivery_service.email_provider = mock_provider
+
+        res = await delivery_service.send_digest(digest_id=digest_id)
+
+        assert res.total_subscribers == 2
+        assert res.sent_count == 0
+        assert res.skipped_count == 2
+        mock_provider.send_email.assert_not_called()
