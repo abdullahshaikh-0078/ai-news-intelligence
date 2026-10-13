@@ -29,6 +29,23 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown routines."""
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION} [{settings.ENVIRONMENT}]")
     logger.info(f"Configured CORS origins: {settings.CORS_ORIGINS}")
+
+    # Idempotent source registry initialization on startup
+    try:
+        from app.infrastructure.database.session import AsyncSessionLocal
+        from app.infrastructure.repositories.source_repo import SourceRepository
+        from app.services.source_service import SourceService
+
+        async with AsyncSessionLocal() as session:
+            source_repo = SourceRepository(session)
+            source_service = SourceService(source_repo)
+            seeded = await source_service.seed_default_sources()
+            logger.info(f"Source registry initialized on startup: {len(seeded)} verified sources active")
+    except Exception as exc:
+        logger.error(
+            f"Startup source registry initialization encountered non-fatal error: {exc.__class__.__name__}: {str(exc)}"
+        )
+
     yield
     logger.info(f"Shutting down {settings.APP_NAME} and disposing database connection pool")
     await engine.dispose()

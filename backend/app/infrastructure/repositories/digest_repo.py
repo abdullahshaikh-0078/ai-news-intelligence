@@ -1,9 +1,12 @@
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.config import settings
+from app.core.logging import logger
 from app.infrastructure.models.digest import Digest, DigestStory, DeliveryRecord
 from app.infrastructure.models.story import Story
 from app.infrastructure.models.content_item import ContentItem
@@ -216,3 +219,150 @@ class DigestRepository(BaseRepository[Digest]):
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def claim_delivery(
+        self,
+        digest_id: uuid.UUID,
+        subscriber_id: uuid.UUID,
+        recipient_email: str,
+        provider: str = "RESEND",
+        claim_timeout_seconds: Optional[int] = None,
+    ) -> Optional[DeliveryRecord]:
+        """
+        Concurrency-safe delivery claim for a given digest and subscriber.
+
+        Guarantees that only one worker is authorized to send by acquiring an atomic claim
+        backed by:
+        1. Database unique constraint uq_delivery_records_digest_subscriber for new records (atomic INSERT).
+        2. Atomic conditional database UPDATE for existing FAILED or stale PENDING records.
+        3. Fresh unpredictable ownership token (claim_token) stored in metadata_json.
+
+        Returns:
+            DeliveryRecord if claim was successfully acquired (status='PENDING').
+            None if delivery is already SENT or currently claimed by another active worker.
+        """
+        now = datetime.now(timezone.utc)
+        timeout_seconds = claim_timeout_seconds or settings.DELIVERY_CLAIM_TIMEOUT_SECONDS
+        stale_cutoff = now - timedelta(seconds=timeout_seconds)
+        claim_token = uuid.uuid4().hex
+
+        existing = await self.get_delivery_record(digest_id, subscriber_id)
+        if existing:
+            # Case 1: Already successfully delivered
+            if existing.status == "SENT":
+                return None
+
+            # Case 2: Claimed and in progress
+            if existing.status == "PENDING":
+                if existing.attempted_at:
+                    attempted_at = existing.attempted_at
+                    if attempted_at.tzinfo is None:
+                        attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+                    elapsed = (now - attempted_at).total_seconds()
+                    if elapsed < timeout_seconds:
+                        # Active claim in flight by another worker; do not send
+                        return None
+
+            # Case 3: Reclaim existing record atomically (FAILED or stale PENDING).
+            # Uses atomic conditional database UPDATE to guarantee that if multiple
+            # workers race to reclaim this existing record, at most ONE acquires it.
+            stmt = (
+                update(DeliveryRecord)
+                .where(
+                    DeliveryRecord.digest_id == digest_id,
+                    DeliveryRecord.subscriber_id == subscriber_id,
+                    or_(
+                        DeliveryRecord.status == "FAILED",
+                        and_(
+                            DeliveryRecord.status == "PENDING",
+                            DeliveryRecord.attempted_at <= stale_cutoff,
+                        ),
+                    ),
+                )
+                .values(
+                    status="PENDING",
+                    attempted_at=now,
+                    provider=provider,
+                    error_message=None,
+                    metadata_json={"claim_token": claim_token},
+                )
+                .returning(DeliveryRecord)
+            )
+            result = await self.session.execute(stmt)
+            reclaimed = result.scalars().first()
+            return reclaimed
+
+        # Case 4: No existing record. Atomically claim via INSERT inside a nested transaction savepoint.
+        try:
+            async with self.session.begin_nested():
+                claim_record = DeliveryRecord(
+                    digest_id=digest_id,
+                    subscriber_id=subscriber_id,
+                    channel="EMAIL",
+                    status="PENDING",
+                    recipient_email=recipient_email,
+                    provider=provider,
+                    attempted_at=now,
+                    metadata_json={"claim_token": claim_token},
+                )
+                self.session.add(claim_record)
+                await self.session.flush()
+            return claim_record
+        except IntegrityError:
+            # Another concurrent worker inserted the claim first; savepoint rolled back.
+            return None
+
+    async def complete_delivery(
+        self,
+        record: DeliveryRecord,
+        status: str,
+        claim_token: Optional[str] = None,
+        provider: str = "RESEND",
+        provider_message_id: Optional[str] = None,
+        delivered_at: Optional[datetime] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[DeliveryRecord]:
+        """
+        Complete a claimed delivery record with final provider status,
+        fenced by explicit claim token and PENDING status.
+
+        Guarantees that an expired or overtaken worker cannot overwrite a newer worker's state.
+        Never logs secret tokens.
+        """
+        now = datetime.now(timezone.utc)
+        token = claim_token or (
+            record.metadata_json.get("claim_token")
+            if isinstance(record.metadata_json, dict)
+            else None
+        )
+
+        where_clauses = [
+            DeliveryRecord.id == record.id,
+            DeliveryRecord.status == "PENDING",
+        ]
+        if token:
+            where_clauses.append(
+                DeliveryRecord.metadata_json["claim_token"].as_string() == token
+            )
+
+        stmt = (
+            update(DeliveryRecord)
+            .where(*where_clauses)
+            .values(
+                status=status,
+                provider=provider,
+                provider_message_id=provider_message_id,
+                delivered_at=delivered_at or (now if status == "SENT" else None),
+                error_message=error_message,
+            )
+            .returning(DeliveryRecord)
+        )
+        result = await self.session.execute(stmt)
+        completed = result.scalars().first()
+        if not completed:
+            logger.warning(
+                f"Delivery completion skipped for delivery_record id={record.id}: "
+                "claim lease was overtaken or already finalized by another worker."
+            )
+            return None
+        return completed

@@ -179,15 +179,27 @@ class DeliveryService:
         dry_run: bool = False,
     ) -> DigestSendResponse:
         """
-        Dispatch a digest issue to all active subscribers.
-        Strict Idempotency:
-        - Checks for existing delivery records for (digest_id, subscriber_id) with status == 'SENT'.
-        - Skips subscribers who have already received this digest issue.
-        - Records each delivery attempt persistently with timestamp and provider message ID.
+        Dispatch a digest issue to all active subscribers with concurrency-safe deduplication.
+
+        Concurrency & Idempotency Architecture:
+        - Atomic Claims: Acquires an atomic claim (status='PENDING') backed by the unique constraint
+          uq_delivery_records_digest_subscriber before making external network calls.
+        - Lock Isolation: Claims are committed immediately before calling the email provider so NO
+          database locks or transactions are held across slow external HTTP requests.
+        - Two-Phase Reality: External HTTP email providers do not participate in two-phase commit (2PC).
+          Therefore, exactly-once delivery cannot be theoretically guaranteed over unreliable networks;
+          this architecture guarantees at-most-once initiation per worker and safe at-least-once retryability.
+        - Provider Confirmation: Deliveries are only marked status='SENT' after provider confirms success.
+        - Fault Isolation: Network/provider failures mark the delivery status='FAILED' for safe retry.
+        - Stale Claim Recovery: Claims stalled in status='PENDING' for >15 minutes can be safely reclaimed.
         """
         digest = await self.digest_repo.get_with_stories(digest_id)
         if not digest:
             raise ValueError(f"Digest issue {digest_id} not found.")
+
+        title = digest.title
+        html_content = digest.html_content
+        plain_text_content = digest.plain_text_content
 
         subscribers = await self.subscriber_repo.list_active(frequency="DAILY")
         total_subscribers = len(subscribers)
@@ -195,77 +207,109 @@ class DeliveryService:
         failed_count = 0
         skipped_count = 0
 
-        now = datetime.now(timezone.utc)
+        provider_name = (
+            "RESEND" if isinstance(self.email_provider, ResendEmailProvider) else "MOCK"
+        )
 
         for sub in subscribers:
-            # Check delivery idempotency
-            existing_delivery = await self.digest_repo.get_delivery_record(digest.id, sub.id)
-            if existing_delivery and existing_delivery.status == "SENT":
-                logger.info(f"Subscriber {sub.email} already received digest {digest.id}. Skipping.")
+            if dry_run:
+                existing_delivery = await self.digest_repo.get_delivery_record(digest.id, sub.id)
+                if existing_delivery and existing_delivery.status == "SENT":
+                    logger.info(f"Subscriber {sub.email} already received digest {digest.id}. Skipping.")
+                    skipped_count += 1
+                    continue
+                logger.info(f"[DRY RUN] Would send digest {digest.id} to {sub.email}")
+                sent_count += 1
+                continue
+
+            # Atomically claim authorization to deliver to this subscriber
+            claim = await self.digest_repo.claim_delivery(
+                digest_id=digest.id,
+                subscriber_id=sub.id,
+                recipient_email=sub.email,
+                provider=provider_name,
+            )
+            if not claim:
+                logger.info(
+                    f"Delivery to subscriber {sub.email} for digest {digest.id} skipped (already sent or claimed by another worker)."
+                )
                 skipped_count += 1
                 continue
+
+            claim_token = (
+                claim.metadata_json.get("claim_token")
+                if isinstance(claim.metadata_json, dict)
+                else None
+            )
+
+            # Persist the PENDING claim immediately so concurrent workers see it
+            # and no DB transactions/locks are held open across the external email HTTP call
+            await self.session.commit()
 
             # Personalize links
             unsubscribe_link = (
                 f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={sub.unsubscribe_token}"
             )
-            preferences_link = f"{settings.NEWSLETTER_BASE_URL}#customize-newsletter"
+            preferences_link = f"{settings.effective_newsletter_base_url}#customize-newsletter"
 
             personalized_html = (
-                digest.html_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
+                html_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
                 .replace("{{ preferences_url }}", preferences_link)
             )
             personalized_text = (
-                digest.plain_text_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
+                plain_text_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
                 .replace("{{ preferences_url }}", preferences_link)
             )
 
-            if dry_run:
-                logger.info(f"[DRY RUN] Would send digest {digest.id} to {sub.email}")
-                sent_count += 1
-                continue
-
-            # Attempt send
-            send_result = await self.email_provider.send_email(
-                to_email=sub.email,
-                subject=digest.title,
-                html_content=personalized_html,
-                text_content=personalized_text,
-            )
-
-            provider_name = (
-                "RESEND" if isinstance(self.email_provider, ResendEmailProvider) else "MOCK"
-            )
+            # Attempt external email send with fault isolation
+            try:
+                send_result = await self.email_provider.send_email(
+                    to_email=sub.email,
+                    subject=title,
+                    html_content=personalized_html,
+                    text_content=personalized_text,
+                )
+            except Exception as exc:
+                logger.error(f"Unexpected error calling email provider for {sub.email}: {exc}")
+                send_result = EmailSendResult(
+                    success=False,
+                    error_message=f"Provider exception: {str(exc)}",
+                )
 
             if send_result.success:
-                sent_count += 1
-                await self.digest_repo.record_delivery(
-                    digest_id=digest.id,
-                    subscriber_id=sub.id,
-                    recipient_email=sub.email,
+                completed = await self.digest_repo.complete_delivery(
+                    record=claim,
                     status="SENT",
+                    claim_token=claim_token,
                     provider=provider_name,
                     provider_message_id=send_result.provider_message_id,
-                    attempted_at=now,
                     delivered_at=datetime.now(timezone.utc),
                 )
+                if completed:
+                    sent_count += 1
+                else:
+                    skipped_count += 1
             else:
-                failed_count += 1
-                await self.digest_repo.record_delivery(
-                    digest_id=digest.id,
-                    subscriber_id=sub.id,
-                    recipient_email=sub.email,
+                completed = await self.digest_repo.complete_delivery(
+                    record=claim,
                     status="FAILED",
+                    claim_token=claim_token,
                     provider=provider_name,
-                    attempted_at=now,
                     error_message=send_result.error_message,
                 )
+                if completed:
+                    failed_count += 1
+                else:
+                    skipped_count += 1
+            await self.session.commit()
 
         if not dry_run:
             if sent_count > 0:
-                digest.status = "SENT"
-                self.session.add(digest)
-            await self.session.commit()
+                fresh_digest = await self.digest_repo.get_with_stories(digest_id)
+                if fresh_digest:
+                    fresh_digest.status = "SENT"
+                    self.session.add(fresh_digest)
+                    await self.session.commit()
 
         return DigestSendResponse(
             digest_id=digest.id,

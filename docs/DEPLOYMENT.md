@@ -98,33 +98,46 @@ Set the following environment variables in your hosting provider's dashboard:
 
 ---
 
-## 4. Automated Daily Dispatch Scheduling (Free Options)
+## 4. Automated Daily Dispatch Scheduling (Target: 9:00 AM IST / 03:30 UTC)
 
-To trigger the daily AI News dispatch automatically without needing 24/7 Celery/Redis workers:
+To trigger the daily AI News dispatch automatically without needing 24/7 background workers (which sleep on Render Free Web Services):
 
-### Option A: GitHub Actions Scheduled Cron (100% Free)
-Create `.github/workflows/daily_dispatch.yml`:
-```yaml
-name: Daily AI News Dispatch
-on:
-  schedule:
-    - cron: '0 6 * * *' # Every day at 06:00 UTC
-  workflow_dispatch:
+### Target Delivery Schedule:
+- **Local Time:** 9:00 AM Asia/Kolkata (IST = UTC+5:30)
+- **UTC Schedule:** 03:30 UTC daily
+- **Cron Expression:** `30 3 * * *` (Minute 30, Hour 3, Every Day)
+- **Idempotency Guarantee:** Date-based digest locking and subscriber delivery records guarantee that re-running or triggering multiple times on the same date will safely skip already-sent subscribers and never send duplicate emails.
 
-jobs:
-  dispatch:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Daily Dispatch API
-        run: |
-          curl -X POST "${{ secrets.PROD_API_URL }}/api/v1/dispatch/daily" \
-            -H "Authorization: Bearer ${{ secrets.DISPATCH_SECRET_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d '{"run_ingestion": true, "dry_run": false}'
-```
+### Option A: Render Cron Job (Native Render Infrastructure)
+In the Render Dashboard:
+1. Click **New +** -> **Cron Job**.
+2. Connect your `ai-news-intelligence` repository (Docker environment).
+3. Set **Schedule:** `30 3 * * *`
+4. Set **Command:**
+   ```bash
+   python -m app.services.dispatch_service
+   ```
+   *(Or trigger the HTTP endpoint if preferred:)*
+   ```bash
+   curl -fsS -X POST "https://ai-news-intelligence-vvh5.onrender.com/api/v1/dispatch/daily" \
+     -H "Authorization: Bearer $DISPATCH_SECRET_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"run_ingestion": true, "dry_run": false}'
+   ```
+5. Attach the same environment group / variables as the web service (`DATABASE_URL`, `GEMINI_API_KEY`, `RESEND_API_KEY`, `DISPATCH_SECRET_TOKEN`).
 
-### Option B: Cloudflare Workers Cron Trigger
-A single Cloudflare Worker on the free plan triggers `POST /api/v1/dispatch/daily` at 06:00 UTC daily.
+### Option B: Free External Webhook Cron (cron-job.org / GitHub Actions)
+If using an external HTTP scheduler to avoid burning Render compute minutes:
+- **URL:** `https://ai-news-intelligence-vvh5.onrender.com/api/v1/dispatch/daily`
+- **Method:** `POST`
+- **Schedule:** `30 3 * * *` (03:30 UTC daily)
+- **Headers:**
+  - `Authorization: Bearer <YOUR_DISPATCH_SECRET_TOKEN>`
+  - `Content-Type: application/json`
+- **Request Body:**
+  ```json
+  {"run_ingestion": true, "dry_run": false}
+  ```
 
 ---
 

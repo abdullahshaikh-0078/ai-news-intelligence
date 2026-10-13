@@ -154,7 +154,7 @@ async def preview_digest_html(
             sub_token = subscriber.unsubscribe_token
 
     preview_unsub = f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={sub_token}"
-    preview_pref = f"{settings.NEWSLETTER_BASE_URL}#customize-newsletter"
+    preview_pref = f"{settings.effective_newsletter_base_url}#customize-newsletter"
 
     # Render with preview links
     preview_html = (

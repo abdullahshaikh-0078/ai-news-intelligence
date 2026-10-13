@@ -95,3 +95,16 @@ async def trigger_source_ingestion(
     """Run ingestion for a specific registered source by UUID."""
     return await orchestrator.ingest_source_by_id(source_id)
 
+
+@router.post(
+    "/all",
+    response_model=IngestionSummaryResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Trigger batch ingestion across all active registered sources",
+)
+async def trigger_all_sources_ingestion(
+    orchestrator: IngestionOrchestrator = Depends(get_orchestrator),
+) -> IngestionSummaryResponse:
+    """Run unified ingestion across all registered active sources (RSS, Web, ArXiv, Hacker News, YouTube)."""
+    return await orchestrator.ingest_all_sources()
+

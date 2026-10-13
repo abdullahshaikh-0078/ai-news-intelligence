@@ -24,11 +24,26 @@ class Settings(BaseSettings):
     @property
     def public_api_v1_url(self) -> str:
         """Canonical public backend API base URL with /api/v1 prefix."""
-        base = self.API_BASE_URL.rstrip("/")
+        import os
+        effective_base = self.API_BASE_URL
+        render_url = os.environ.get("RENDER_EXTERNAL_URL")
+        if render_url and ("127.0.0.1" in effective_base or "localhost" in effective_base):
+            effective_base = render_url
+        base = effective_base.rstrip("/")
         if base.endswith("/api/v1"):
             return base
         api_prefix = self.API_V1_STR.strip("/")
         return f"{base}/{api_prefix}"
+
+    @property
+    def effective_newsletter_base_url(self) -> str:
+        """Effective frontend portfolio URL for newsletter action and preference links."""
+        import os
+        if self.NEWSLETTER_BASE_URL and "127.0.0.1" not in self.NEWSLETTER_BASE_URL and "localhost" not in self.NEWSLETTER_BASE_URL:
+            return self.NEWSLETTER_BASE_URL
+        if self.ENVIRONMENT in ("production", "staging") or os.environ.get("RENDER"):
+            return "https://abdullah-shaikh-portfolio.vercel.app"
+        return self.NEWSLETTER_BASE_URL
 
     # Server binding
     HOST: str = "0.0.0.0"
@@ -156,12 +171,14 @@ class Settings(BaseSettings):
     NEWSLETTER_BASE_URL: str = "http://127.0.0.1:5500"
     DIGEST_MIN_STORIES: int = 5
     DIGEST_MAX_STORIES: int = 10
+    DELIVERY_CLAIM_TIMEOUT_SECONDS: int = 900
 
     # Resend Webhooks & Dispatch Configuration (Phase 18)
     RESEND_WEBHOOK_SECRET: str | None = None
     DISPATCH_SECRET_TOKEN: str | None = None
     DISPATCH_CRON_ENABLED: bool = False
-    DISPATCH_SCHEDULE_HOUR_UTC: int = 6
+    DISPATCH_SCHEDULE_HOUR_UTC: int = 3
+    DISPATCH_SCHEDULE_MINUTE_UTC: int = 30
 
     # External Service Keys
     YOUTUBE_API_KEY: str | None = None

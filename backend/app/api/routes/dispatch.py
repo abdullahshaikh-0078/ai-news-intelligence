@@ -23,16 +23,25 @@ def verify_dispatch_auth(
     x_dispatch_token: Optional[str] = Header(None),
 ) -> None:
     """Validate dispatch trigger authorization if DISPATCH_SECRET_TOKEN is configured."""
-    if not settings.DISPATCH_SECRET_TOKEN:
+    secret_token = (settings.DISPATCH_SECRET_TOKEN or "").strip()
+    if not secret_token:
+        if settings.ENVIRONMENT in ("production", "staging"):
+            logger.error(
+                "Dispatch execution rejected: DISPATCH_SECRET_TOKEN is not configured in production/staging environment."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Dispatch endpoint disabled: DISPATCH_SECRET_TOKEN must be configured in production or staging",
+            )
         return
 
     token = None
-    if authorization and authorization.startswith("Bearer "):
+    if isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization.split("Bearer ", 1)[1].strip()
-    elif x_dispatch_token:
+    elif isinstance(x_dispatch_token, str):
         token = x_dispatch_token.strip()
 
-    if not token or token != settings.DISPATCH_SECRET_TOKEN:
+    if not token or token != secret_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: invalid or missing dispatch authorization token",
@@ -83,8 +92,10 @@ async def get_dispatch_status(
         environment=settings.ENVIRONMENT,
         cron_enabled=settings.DISPATCH_CRON_ENABLED,
         schedule_hour_utc=settings.DISPATCH_SCHEDULE_HOUR_UTC,
+        schedule_minute_utc=settings.DISPATCH_SCHEDULE_MINUTE_UTC,
         resend_configured=bool(settings.RESEND_API_KEY),
         webhook_secret_configured=bool(settings.RESEND_WEBHOOK_SECRET),
+        dispatch_token_configured=bool(settings.DISPATCH_SECRET_TOKEN),
         latest_digest_date=latest_digest.digest_date if latest_digest else None,
         latest_digest_id=latest_digest.id if latest_digest else None,
         latest_digest_stories=latest_digest.story_count if latest_digest else 0,

@@ -59,6 +59,22 @@ class DailyDispatchService:
         )
 
         # -----------------------------------------------------------------
+        # Stage 0: Guard that baseline sources exist in registry
+        # -----------------------------------------------------------------
+        if req.run_ingestion:
+            from app.infrastructure.repositories.source_repo import SourceRepository
+            from app.services.source_service import SourceService
+            source_repo = SourceRepository(self.session)
+            enabled_sources = await source_repo.list_enabled()
+            if not enabled_sources:
+                logger.info(
+                    f"[Daily Dispatch {execution_id}] 0 enabled sources found in registry. "
+                    "Auto-seeding verified baseline sources before pipeline pass..."
+                )
+                source_service = SourceService(source_repo)
+                await source_service.seed_default_sources()
+
+        # -----------------------------------------------------------------
         # Stage 1: Pipeline Pass (Ingestion, AI analysis, Embeddings, Ranking, Curation)
         # -----------------------------------------------------------------
         pipeline_req = PipelineRunRequest(

@@ -267,11 +267,14 @@ class SourceService:
 
             if existing:
                 existing.url = clean_url
-                # Update config/reliability if upgrading baseline
+                # Preserve existing administrator configuration, backfilling only missing default keys
                 if defn.configuration:
-                    existing.config = {**existing.config, **defn.configuration}
-                if defn.reliability_score:
+                    current_config = existing.config if isinstance(existing.config, dict) else {}
+                    existing.config = {**defn.configuration, **current_config}
+                # Preserve existing reliability score adjustments if already set on the existing record
+                if existing.reliability_score is None and defn.reliability_score is not None:
                     existing.reliability_score = defn.reliability_score
+                # Intentionally preserved without modification: existing.enabled, existing.slug, existing.id
                 await self.repository.update(existing)
                 seeded.append(existing)
             else:

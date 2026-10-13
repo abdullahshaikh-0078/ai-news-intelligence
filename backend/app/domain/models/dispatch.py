@@ -40,8 +40,10 @@ class DispatchStatusResponse(BaseModel):
     environment: str
     cron_enabled: bool
     schedule_hour_utc: int
+    schedule_minute_utc: int = 30
     resend_configured: bool
     webhook_secret_configured: bool
+    dispatch_token_configured: bool = False
     latest_digest_date: Optional[date] = None
     latest_digest_id: Optional[uuid.UUID] = None
     latest_digest_stories: int = 0

@@ -173,13 +173,14 @@ class PipelineOrchestratorService:
         # Stage 1: Optional Ingestion Pass
         # -----------------------------------------------------------------
         if req.run_ingestion:
-            logger.info("[Pipeline Stage 1] Triggering bounded RSS ingestion pass...")
+            logger.info("[Pipeline Stage 1] Triggering bounded multi-source ingestion pass across all registered sources...")
             try:
                 ingestion_orchestrator = IngestionOrchestrator(self.session)
-                ing_summary = await ingestion_orchestrator.ingest_all_rss_sources()
+                ing_summary = await ingestion_orchestrator.ingest_all_sources()
                 logger.info(
                     f"[Pipeline Stage 1] Ingestion complete: fetched={ing_summary.total_fetched}, "
-                    f"inserted={ing_summary.total_inserted}, updated={ing_summary.total_updated}"
+                    f"inserted={ing_summary.total_inserted}, updated={ing_summary.total_updated}, "
+                    f"skipped={ing_summary.total_skipped}"
                 )
             except Exception as exc:
                 logger.error(f"[Pipeline Stage 1] Ingestion stage failure: {exc.__class__.__name__}: {str(exc)}")

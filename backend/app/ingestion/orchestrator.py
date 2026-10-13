@@ -518,3 +518,67 @@ class IngestionOrchestrator:
         )
         return summary
 
+    async def ingest_all_sources(self) -> IngestionSummaryResponse:
+        """Ingest all enabled registered sources across all supported adapters with per-source fault isolation."""
+        overall_start = time.time()
+        enabled_sources = await self.source_repo.list_enabled()
+
+        results: List[SourceIngestionResult] = []
+        succeeded = 0
+        failed = 0
+        total_fetched = 0
+        total_inserted = 0
+        total_updated = 0
+        total_skipped = 0
+
+        logger.info(
+            f"Starting unified multi-source ingestion for {len(enabled_sources)} enabled sources across all adapters"
+        )
+
+        for source in enabled_sources:
+            try:
+                res = await self.ingest_source(source)
+                results.append(res)
+                if res.status in ("SUCCESS", "PARTIAL"):
+                    succeeded += 1
+                else:
+                    failed += 1
+
+                total_fetched += res.entries_fetched
+                total_inserted += res.entries_inserted
+                total_updated += res.entries_updated
+                total_skipped += res.entries_skipped
+
+            except Exception as exc:
+                logger.error(
+                    f"Unhandled error during unified ingestion of source '{source.name}' [type={source.type}]: {str(exc)}"
+                )
+                failed += 1
+                results.append(
+                    SourceIngestionResult(
+                        source_id=source.id,
+                        source_name=source.name,
+                        source_type=source.type,
+                        status="FAILED",
+                        errors=[str(exc)],
+                    )
+                )
+
+        summary = IngestionSummaryResponse(
+            total_sources=len(enabled_sources),
+            succeeded_sources=succeeded,
+            failed_sources=failed,
+            total_fetched=total_fetched,
+            total_inserted=total_inserted,
+            total_updated=total_updated,
+            total_skipped=total_skipped,
+            source_results=results,
+            total_duration_seconds=round(time.time() - overall_start, 3),
+        )
+
+        logger.info(
+            f"Unified multi-source ingestion finished: {succeeded}/{len(enabled_sources)} succeeded, "
+            f"fetched={total_fetched}, inserted={total_inserted}, updated={total_updated}, skipped={total_skipped}"
+        )
+        return summary
+

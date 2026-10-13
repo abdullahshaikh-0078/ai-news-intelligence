@@ -97,7 +97,7 @@ async def unsubscribe_get(
         service = SubscriberService(session=session)
         success = await service.unsubscribe(token=clean_token, email=clean_email)
 
-    home_url = settings.NEWSLETTER_BASE_URL or "http://127.0.0.1:5500"
+    home_url = settings.effective_newsletter_base_url
 
     if success:
         page_title = "Unsubscribed — AI News Daily"
