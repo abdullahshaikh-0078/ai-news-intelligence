@@ -1,0 +1,90 @@
+name: Newsletter Scheduler
+
+"on":
+  schedule:
+    # Run once every hour at minute 0
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Simulate dispatch without sending emails or mutating delivery state"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  dispatch:
+    name: Trigger Hourly Newsletter Scheduler
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Render Scheduler Endpoint
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL || vars.RENDER_API_URL }}
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_SECRET_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          BASE_URL="${RENDER_API_URL:-https://ai-news-intelligence-vvh5.onrender.com}"
+          ENDPOINT="${BASE_URL%/}/api/v1/dispatch/scheduler"
+
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::error::DISPATCH_SECRET_TOKEN secret is not configured in repository secrets."
+            exit 1
+          fi
+
+          PAYLOAD="{}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            PAYLOAD='{"dry_run": true}'
+          fi
+
+          echo "Triggering production scheduler tick at: ${ENDPOINT}"
+          echo "Dry run mode: ${DRY_RUN}"
+
+          HTTP_RESPONSE=$(curl -s -S -w "\n%{http_code}" \
+            -X POST "${ENDPOINT}" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: GitHub-Actions-Scheduler/1.0" \
+            -d "${PAYLOAD}")
+
+          HTTP_BODY=$(echo "${HTTP_RESPONSE}" | sed '$d')
+          HTTP_STATUS=$(echo "${HTTP_RESPONSE}" | tail -n1)
+
+          echo "HTTP Status Code: ${HTTP_STATUS}"
+
+          if [ "${HTTP_STATUS}" -ne 200 ]; then
+            echo "::error::Scheduler endpoint returned non-200 status code: ${HTTP_STATUS}"
+            echo "Response: ${HTTP_BODY}"
+            exit 1
+          fi
+
+          echo "Scheduler tick executed successfully."
+
+          # Parse and print safe diagnostic telemetry if jq is available
+          if command -v jq >/dev/null 2>&1; then
+            echo "=== Scheduler Telemetry ==="
+            echo "${HTTP_BODY}" | jq '{
+              status: .status,
+              execution_id: .execution_id,
+              target_time_utc: .target_time_utc,
+              collection_executed: .collection_executed,
+              digest_compiled: .digest_compiled,
+              due_subscribers_count: .due_subscribers_count,
+              sent_count: .sent_count,
+              skipped_count: .skipped_count,
+              failed_count: .failed_count,
+              cleanup_executed: .cleanup_executed,
+              duration_seconds: .duration_seconds
+            }'
+          else
+            echo "Response: ${HTTP_BODY}"
+          fi
+
+          # Fail step if execution status in payload indicates an error
+          EXEC_STATUS=$(echo "${HTTP_BODY}" | jq -r '.status // empty' 2>/dev/null || echo "")
+          if [ "${EXEC_STATUS}" = "error" ]; then
+            echo "::error::Scheduler tick reported domain status 'error'."
+            exit 1
+          fi
