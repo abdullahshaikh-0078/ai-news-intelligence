@@ -10,7 +10,7 @@ def test_alembic_configuration_and_revisions():
     alembic_cfg = Config(ini_path)
     script_loc = "alembic" if os.path.exists("alembic") else "backend/alembic"
     alembic_cfg.set_main_option("script_location", script_loc)
-    alembic_cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    alembic_cfg.set_main_option("sqlalchemy.url", settings.migration_database_url)
 
     script_dir = ScriptDirectory.from_config(alembic_cfg)
     heads = script_dir.get_heads()

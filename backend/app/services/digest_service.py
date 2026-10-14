@@ -127,19 +127,28 @@ class DigestService:
         stories: List[CuratedStoryResponse],
         unsubscribe_url: str = "{{ unsubscribe_url }}",
         preferences_url: str = "{{ preferences_url }}",
+        app_url: str = "{{ app_url }}",
     ) -> str:
-        """Render responsive HTML email string."""
+        """Render responsive, accessible HTML daily digest email."""
+        effective_app_url = app_url or settings.effective_newsletter_base_url
         formatted_date = issue_date.strftime("%B %d, %Y")
+        story_count = len(stories)
         
+        # Extract preheader snippet from first story or fallback
+        first_summary = stories[0].summary if stories and stories[0].summary else ""
+        preheader_text = html.escape(
+            (first_summary[:140] + "...") if len(first_summary) > 140 else (first_summary or "Today's high-signal AI developments and research briefings.")
+        )
+
         stories_html = []
         if not stories:
             stories_html.append(
-                """<div style="padding: 24px; text-align: center; color: #94a3b8; font-size: 14px;">
-                    No eligible stories reached the curation threshold for this digest date.
+                """<div style="padding: 32px 24px; text-align: center; color: #94a3b8; font-size: 14px; background-color: #1e293b; border-radius: 8px;">
+                    No eligible stories reached the editorial curation threshold for this digest date.
                 </div>"""
             )
         else:
-            for s in stories:
+            for idx, s in enumerate(stories, start=1):
                 safe_title = html.escape(s.title or "Untitled Story")
                 safe_summary = html.escape(s.summary or s.key_takeaway or "")
                 safe_category = html.escape(s.category or "AI Intel")
@@ -159,17 +168,19 @@ class DigestService:
                 if s.canonical_url:
                     cta_html = f"""
                     <div style="margin-top: 14px;">
-                      <a href="{html.escape(s.canonical_url)}" style="display: inline-block; padding: 8px 16px; background-color: #0284c7; color: #ffffff; text-decoration: none; font-size: 12px; font-weight: 600; border-radius: 6px;" target="_blank" rel="noopener noreferrer">Read Full Source &rarr;</a>
+                      <a href="{html.escape(s.canonical_url)}" style="display: inline-block; padding: 8px 18px; background-color: #0284c7; color: #ffffff; text-decoration: none; font-size: 12px; font-weight: 600; border-radius: 6px; box-shadow: 0 2px 6px rgba(2, 132, 199, 0.25);" target="_blank" rel="noopener noreferrer">Read Full Source &rarr;</a>
                     </div>
                     """
 
                 card = f"""
                 <div style="margin-bottom: 32px; padding-bottom: 32px; border-bottom: 1px solid #1e293b;">
                   <div style="margin-bottom: 10px;">
-                    <span style="display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; background-color: rgba(56, 189, 248, 0.12); color: #38bdf8; margin-right: 8px;">{safe_category}</span>
-                    <span style="font-size: 12px; color: #64748b; font-weight: 500;">Source: {safe_source}</span>
+                    <span style="display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; background-color: rgba(56, 189, 248, 0.12); color: #38bdf8; margin-right: 8px;">{safe_category}</span>
+                    <span style="font-size: 12px; color: #94a3b8; font-weight: 500;">Source: <strong style="color: #cbd5e1;">{safe_source}</strong></span>
                   </div>
-                  <h2 style="font-size: 18px; font-weight: 700; color: #f1f5f9; margin: 0 0 12px 0; line-height: 1.4;">{safe_title}</h2>
+                  <h2 style="font-size: 18px; font-weight: 700; color: #f8fafc; margin: 0 0 12px 0; line-height: 1.4;">
+                    <span style="color: #64748b; font-weight: 500; margin-right: 6px;">#{idx}</span>{safe_title}
+                  </h2>
                   <p style="font-size: 14px; line-height: 1.6; color: #cbd5e1; margin: 0 0 14px 0;">{safe_summary}</p>
                   {why_html}
                   {cta_html}
@@ -191,20 +202,33 @@ class DigestService:
     body {{ height: 100% !important; margin: 0 !important; padding: 0 !important; width: 100% !important; background-color: #0b0f19; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #e2e8f0; }}
     @media only screen and (max-width: 640px) {{
       .email-container {{ width: 100% !important; border-radius: 0 !important; border: none !important; }}
-      .header, .content, .footer {{ padding-left: 20px !important; padding-right: 20px !important; }}
+      .header, .intro, .content, .footer {{ padding-left: 20px !important; padding-right: 20px !important; }}
     }}
   </style>
 </head>
 <body style="background-color: #0b0f19; margin: 0; padding: 0;">
+  <!-- Preheader preview text -->
+  <div style="display: none; max-height: 0px; overflow: hidden; font-size: 1px; line-height: 1px; color: #fff; opacity: 0;">
+    {preheader_text}
+  </div>
   <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #0b0f19; padding: 24px 0;">
     <tr>
       <td align="center">
         <div class="email-container" style="max-width: 640px; margin: 0 auto; background-color: #0f172a; border-radius: 12px; overflow: hidden; border: 1px solid #1e293b; text-align: left;">
           <!-- Header -->
-          <div class="header" style="padding: 36px 32px 24px; border-bottom: 1px solid #1e293b;">
-            <div style="font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; margin-bottom: 8px;">AI NEWS INTELLIGENCE • DAILY DIGEST</div>
+          <div class="header" style="padding: 36px 32px 24px; border-bottom: 1px solid #1e293b; background: linear-gradient(180deg, #111c35 0%, #0f172a 100%);">
+            <div style="display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; background-color: rgba(56, 189, 248, 0.12); color: #38bdf8; margin-bottom: 10px;">
+              AI NEWS INTELLIGENCE • DAILY BRIEFING
+            </div>
             <h1 style="font-size: 24px; font-weight: 800; color: #f8fafc; margin: 0 0 8px 0; line-height: 1.3;">{html.escape(title)}</h1>
-            <p style="font-size: 14px; color: #94a3b8; margin: 0;">{formatted_date} • Curated high-signal AI developments</p>
+            <p style="font-size: 14px; color: #94a3b8; margin: 0;">{formatted_date} • {story_count} Curated Intelligence Developments</p>
+          </div>
+
+          <!-- Introduction Section -->
+          <div class="intro" style="padding: 24px 32px 20px; border-bottom: 1px solid #1e293b; background-color: #0b1120;">
+            <p style="font-size: 14px; line-height: 1.6; color: #94a3b8; margin: 0;">
+              Welcome to today's intelligence briefing. Our autonomous pipeline has monitored, deduplicated, and ranked the latest breakthroughs across AI research labs, engineering preprints, and developer ecosystems.
+            </p>
           </div>
           
           <!-- Content -->
@@ -215,11 +239,12 @@ class DigestService:
           <!-- Footer -->
           <div class="footer" style="padding: 32px; background-color: #090d16; text-align: center; border-top: 1px solid #1e293b;">
             <p style="font-size: 12px; color: #64748b; margin: 0 0 12px 0; line-height: 1.6;">
-              You are receiving this because you subscribed to the AI News Daily Digest on Abdullah Shaikh's AI Systems platform.<br>
-              Delivering high-signal intelligence across AI Agents, RAG, Research, and Systems.
+              You are receiving this briefing because you subscribed to AI News Intelligence on Abdullah Shaikh's AI Systems platform.<br>
+              Curating high-signal intelligence across AI Agents, RAG, Foundation Models, and Systems.
             </p>
             <div style="font-size: 12px;">
-              <a href="{preferences_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">Update Preferences</a> • 
+              <a href="{preferences_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">Manage Preferences</a> &bull;
+              <a href="{effective_app_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">AI News / Portfolio</a> &bull;
               <a href="{unsubscribe_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">Unsubscribe</a>
             </div>
           </div>
@@ -236,23 +261,32 @@ class DigestService:
         issue_date: date,
         stories: List[CuratedStoryResponse],
         unsubscribe_url: str = "{{ unsubscribe_url }}",
+        preferences_url: str = "{{ preferences_url }}",
+        app_url: str = "{{ app_url }}",
     ) -> str:
         """Render plain text fallback for email clients without HTML support."""
+        effective_app_url = app_url or settings.effective_newsletter_base_url
         formatted_date = issue_date.strftime("%B %d, %Y")
+        story_count = len(stories)
         lines = [
             f"=== {title.upper()} ===",
-            f"{formatted_date} | Curated AI Developments",
+            f"{formatted_date} | {story_count} Curated AI Intelligence Developments",
             "=" * 50,
+            "",
+            "Welcome to today's intelligence briefing. Curated across top AI research labs,",
+            "engineering blogs, and preprints.",
+            "",
+            "-" * 50,
             "",
         ]
 
         if not stories:
-            lines.append("No eligible stories reached the curation threshold for this digest date.\n")
+            lines.append("No eligible stories reached the editorial curation threshold for this digest date.\n")
         else:
             for idx, s in enumerate(stories, start=1):
-                lines.append(f"{idx}. {s.title}")
+                lines.append(f"#{idx} {s.title}")
                 if s.primary_source_name or s.category:
-                    lines.append(f"   [{s.category or 'AI'}] Source: {s.primary_source_name or 'Official'}")
+                    lines.append(f"   [{s.category or 'AI'}] Source: {s.primary_source_name or 'Official Source'}")
                 if s.summary:
                     lines.append(f"   Summary: {s.summary}")
                 if s.why_it_matters:
@@ -263,7 +297,9 @@ class DigestService:
 
         lines.extend([
             "=" * 50,
-            "You received this because you subscribed to AI News Daily Digest.",
+            "You received this because you subscribed to AI News Intelligence Daily Digest.",
+            f"Manage Preferences: {preferences_url}",
+            f"AI News / Portfolio: {effective_app_url}",
             f"Unsubscribe: {unsubscribe_url}",
         ])
         return "\n".join(lines)

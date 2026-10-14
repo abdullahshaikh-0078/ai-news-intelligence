@@ -6,9 +6,14 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.domain.models.curation import CuratedStoryResponse
 from app.domain.models.dispatch import DailyDispatchRequest, DispatchStatusResponse
+from app.domain.models.newsletter import (
+    PreferencesUpdateRequest,
+    SubscribeRequest,
+    SubscribeResponse,
+)
 from app.domain.models.source import SourceType
 from app.domain.schemas.source import SourceCreate
 from app.infrastructure.models.content_item import ContentItem
@@ -19,10 +24,18 @@ from app.infrastructure.models.subscriber import Subscriber
 from app.infrastructure.repositories.digest_repo import DigestRepository
 from app.ingestion.orchestrator import IngestionOrchestrator
 from app.services.digest_service import DigestService
-from app.services.dispatch_service import DailyDispatchService
-from app.services.email_service import DeliveryService, MockEmailProvider
+from app.services.dispatch_service import DailyDispatchService, _run_cli
+from app.services.email_service import (
+    DeliveryService,
+    EmailSendResult,
+    MockEmailProvider,
+    ResendEmailProvider,
+    WelcomeEmailService,
+)
 from app.services.source_service import SourceService
+from app.services.subscriber_service import SubscriberService
 from app.api.routes.dispatch import verify_dispatch_auth, get_dispatch_status
+import httpx
 
 
 class TestSourceSeedingIdempotency:
@@ -1164,3 +1177,544 @@ class TestEmptyDigestDeliveryGuard:
         assert res.sent_count == 0
         assert res.skipped_count == 2
         mock_provider.send_email.assert_not_called()
+
+
+class TestSubscriptionLifecycleAndWelcomeEmail:
+    """Test subscription validation, persistence-first welcome email dispatch, and idempotency."""
+
+    @pytest.mark.asyncio
+    async def test_new_subscription_saves_and_sends_welcome_email_with_idempotency_key(self):
+        """Newly created subscriber is committed to DB first, then welcome email is sent with idempotency key."""
+        mock_session = AsyncMock()
+        mock_welcome = AsyncMock()
+        mock_welcome.send_welcome_email = AsyncMock(
+            return_value=EmailSendResult(success=True, provider_message_id="msg_welcome_123")
+        )
+        service = SubscriberService(session=mock_session, welcome_service=mock_welcome)
+
+        sub_id = uuid.uuid4()
+        fake_sub = Subscriber(
+            id=sub_id,
+            email="newbie@example.com",
+            name="Alice",
+            topics=["AI Agents", "RAG"],
+            is_active=True,
+            unsubscribe_token="token_alice",
+        )
+        setattr(fake_sub, "_was_reactivated", False)
+        service.repo.upsert_subscriber = AsyncMock(return_value=(fake_sub, True))
+
+        call_order = []
+        mock_session.commit.side_effect = lambda: call_order.append("commit")
+        mock_welcome.send_welcome_email.side_effect = lambda sub: (
+            call_order.append("send_email"),
+            EmailSendResult(success=True, provider_message_id="msg_welcome_123"),
+        )[1]
+
+        sub, is_created = await service.subscribe(
+            SubscribeRequest(
+                email="newbie@example.com",
+                name="Alice",
+                topics=["AI Agents", "RAG"],
+                timezone="Asia/Kolkata",
+            )
+        )
+
+        assert is_created is True
+        assert sub.email == "newbie@example.com"
+        assert call_order == ["commit", "send_email"]  # Commit strictly precedes email dispatch
+        mock_welcome.send_welcome_email.assert_called_once_with(fake_sub)
+
+    @pytest.mark.asyncio
+    async def test_invalid_email_format_is_rejected(self):
+        """Invalid email formats fail validation with ValueError before any database or provider call."""
+        with pytest.raises(ValueError, match="Invalid email address format"):
+            SubscribeRequest(email="invalid-no-at")
+
+        with pytest.raises(ValueError, match="Invalid email address format"):
+            SubscribeRequest(email="user@nodomain")
+
+        with pytest.raises(ValueError, match="Invalid email address format"):
+            SubscribeRequest(email="spaces in@email.com")
+
+    @pytest.mark.asyncio
+    async def test_duplicate_signup_updates_preferences_and_skips_welcome_message(self):
+        """Duplicate active signup updates preferences idempotently and skips sending a duplicate welcome email."""
+        mock_session = AsyncMock()
+        mock_welcome = AsyncMock()
+        service = SubscriberService(session=mock_session, welcome_service=mock_welcome)
+
+        fake_sub = Subscriber(
+            id=uuid.uuid4(),
+            email="existing@example.com",
+            name="Alice Updated",
+            topics=["Research"],
+            is_active=True,
+            unsubscribe_token="token_existing",
+        )
+        setattr(fake_sub, "_was_reactivated", False)
+        service.repo.upsert_subscriber = AsyncMock(return_value=(fake_sub, False))
+
+        sub, is_created = await service.subscribe(
+            SubscribeRequest(
+                email="existing@example.com",
+                name="Alice Updated",
+                topics=["Research"],
+            )
+        )
+
+        assert is_created is False
+        assert sub.name == "Alice Updated"
+        mock_session.commit.assert_called_once()
+        mock_welcome.send_welcome_email.assert_not_called()  # Duplicate active subscriber does not get spammed
+
+    @pytest.mark.asyncio
+    async def test_reactivated_subscriber_sends_confirmation_welcome_email(self):
+        """Reactivated subscriber (previously unsubscribed) receives confirmation email."""
+        mock_session = AsyncMock()
+        mock_welcome = AsyncMock()
+        mock_welcome.send_welcome_email = AsyncMock(
+            return_value=EmailSendResult(success=True, provider_message_id="msg_reactivated")
+        )
+        service = SubscriberService(session=mock_session, welcome_service=mock_welcome)
+
+        fake_sub = Subscriber(
+            id=uuid.uuid4(),
+            email="returning@example.com",
+            is_active=True,
+            unsubscribe_token="token_returning",
+        )
+        setattr(fake_sub, "_was_reactivated", True)
+        service.repo.upsert_subscriber = AsyncMock(return_value=(fake_sub, False))
+
+        sub, is_created = await service.subscribe(
+            SubscribeRequest(email="returning@example.com")
+        )
+
+        assert is_created is False
+        assert getattr(sub, "_was_reactivated", False) is True
+        mock_session.commit.assert_called_once()
+        mock_welcome.send_welcome_email.assert_called_once_with(fake_sub)
+
+    @pytest.mark.asyncio
+    async def test_database_persistence_failure_prevents_welcome_email_dispatch(self):
+        """Database commit failure raises exception and completely prevents welcome email dispatch."""
+        mock_session = AsyncMock()
+        mock_session.commit.side_effect = RuntimeError("Database connection lost")
+        mock_welcome = AsyncMock()
+        service = SubscriberService(session=mock_session, welcome_service=mock_welcome)
+
+        fake_sub = Subscriber(
+            id=uuid.uuid4(),
+            email="fail@example.com",
+            is_active=True,
+            unsubscribe_token="tok_fail",
+        )
+        setattr(fake_sub, "_was_reactivated", False)
+        service.repo.upsert_subscriber = AsyncMock(return_value=(fake_sub, True))
+
+        with pytest.raises(RuntimeError, match="Database connection lost"):
+            await service.subscribe(SubscribeRequest(email="fail@example.com"))
+
+        mock_welcome.send_welcome_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_welcome_email_provider_failure_does_not_rollback_subscription(self):
+        """If email provider returns failure after successful persistence, subscription remains safely committed."""
+        mock_session = AsyncMock()
+        mock_welcome = AsyncMock()
+        mock_welcome.send_welcome_email = AsyncMock(
+            return_value=EmailSendResult(success=False, error_message="Resend 500 timeout")
+        )
+        service = SubscriberService(session=mock_session, welcome_service=mock_welcome)
+
+        fake_sub = Subscriber(
+            id=uuid.uuid4(),
+            email="safe@example.com",
+            is_active=True,
+            unsubscribe_token="tok_safe",
+        )
+        setattr(fake_sub, "_was_reactivated", False)
+        service.repo.upsert_subscriber = AsyncMock(return_value=(fake_sub, True))
+
+        sub, is_created = await service.subscribe(SubscribeRequest(email="safe@example.com"))
+
+        assert is_created is True
+        assert sub.email == "safe@example.com"
+        mock_session.commit.assert_called_once()
+        mock_session.rollback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timezone_and_channel_alias_support(self):
+        """SubscribeRequest and PreferencesUpdateRequest normalize channel alias and accept timezone."""
+        req = SubscribeRequest(
+            email="alias@example.com",
+            channel="EMAIL",
+            timezone="Asia/Kolkata",
+        )
+        assert req.preferred_channel == "EMAIL"
+        assert req.timezone == "Asia/Kolkata"
+
+        pref = PreferencesUpdateRequest(
+            email="alias@example.com",
+            channel="EMAIL",
+            timezone="America/New_York",
+        )
+        assert pref.preferred_channel == "EMAIL"
+        assert pref.timezone == "America/New_York"
+
+
+class TestResendEmailProviderIdempotency:
+    """Test ResendEmailProvider idempotency key headers and error isolation."""
+
+    @pytest.mark.asyncio
+    async def test_resend_email_provider_passes_idempotency_key_header(self):
+        """When idempotency_key is provided, ResendEmailProvider includes Idempotency-Key in HTTP headers."""
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = MagicMock(status_code=200, json=lambda: {"id": "resend_id_789"})
+
+            provider = ResendEmailProvider(api_key="re_valid_key", from_email="AI News <news@example.com>")
+            result = await provider.send_email(
+                to_email="recipient@example.com",
+                subject="Test Subject",
+                html_content="<p>Test</p>",
+                idempotency_key="welcome-uuid-12345",
+            )
+
+            assert result.success is True
+            assert result.provider_message_id == "resend_id_789"
+            mock_post.assert_called_once()
+            call_kwargs = mock_post.call_args.kwargs
+            headers = call_kwargs["headers"]
+            assert headers["Idempotency-Key"] == "welcome-uuid-12345"
+            assert headers["Authorization"] == "Bearer re_valid_key"
+            payload = call_kwargs["json"]
+            assert payload["to"] == ["recipient@example.com"]
+            assert payload["subject"] == "Test Subject"
+
+    @pytest.mark.asyncio
+    async def test_resend_email_provider_missing_api_key_returns_safe_failure(self):
+        """Unconfigured RESEND_API_KEY returns EmailSendResult(success=False) without crashing."""
+        provider = ResendEmailProvider(api_key=None)
+        with patch.object(settings, "RESEND_API_KEY", None):
+            provider.api_key = None
+            result = await provider.send_email(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>Test</p>",
+            )
+            assert result.success is False
+            assert "RESEND_API_KEY is not configured" in result.error_message
+
+
+class TestRedesignedDigestTemplate:
+    """Test redesigned daily digest HTML and plain-text template generation."""
+
+    def test_render_html_digest_contains_preheader_intro_and_structure(self):
+        """HTML digest output includes preheader snippet, introduction banner, story count, and accessible footer."""
+        digest_service = DigestService(session=AsyncMock())
+        story1 = CuratedStoryResponse(
+            story_id=uuid.uuid4(),
+            title="Breakthrough in Multi-Agent Planning",
+            summary="Novel architecture achieves state-of-the-art benchmarks in complex tool orchestration.",
+            ranking_score=0.95,
+            category="AI Agents",
+            primary_source_name="ArXiv",
+            canonical_url="https://arxiv.org/abs/2609.12345",
+            why_it_matters="Reduces reasoning latency by 4x across heterogeneous agent groups.",
+        )
+
+        html_out = digest_service.render_html_digest(
+            title="AI News Daily Digest — September 11, 2026",
+            issue_date=date(2026, 9, 11),
+            stories=[story1],
+            unsubscribe_url="https://api.test/unsubscribe?token=abc",
+            preferences_url="https://app.test/#customize",
+        )
+
+        assert "AI NEWS INTELLIGENCE • DAILY BRIEFING" in html_out
+        assert "AI News Daily Digest — September 11, 2026" in html_out
+        assert "1 Curated Intelligence Developments" in html_out
+        assert "Welcome to today's intelligence briefing." in html_out
+        assert "#1" in html_out
+        assert "Breakthrough in Multi-Agent Planning" in html_out
+        assert "Source: <strong style=\"color: #cbd5e1;\">ArXiv</strong>" in html_out
+        assert "Why it matters" in html_out
+        assert "Read Full Source &rarr;" in html_out
+        assert "https://arxiv.org/abs/2609.12345" in html_out
+        assert "https://api.test/unsubscribe?token=abc" in html_out
+        assert "https://app.test/#customize" in html_out
+
+    def test_render_plain_text_digest_structure(self):
+        """Plain-text digest output formats stories with dividers, categories, sources, and unsubscribe URL."""
+        digest_service = DigestService(session=AsyncMock())
+        story1 = CuratedStoryResponse(
+            story_id=uuid.uuid4(),
+            title="Breakthrough in Multi-Agent Planning",
+            summary="Novel architecture achieves state-of-the-art benchmarks.",
+            ranking_score=0.95,
+            category="AI Agents",
+            primary_source_name="ArXiv",
+            canonical_url="https://arxiv.org/abs/2609.12345",
+            why_it_matters="Reduces reasoning latency by 4x.",
+        )
+
+        text_out = digest_service.render_plain_text_digest(
+            title="AI News Daily Digest",
+            issue_date=date(2026, 9, 11),
+            stories=[story1],
+            unsubscribe_url="https://api.test/unsubscribe?token=abc",
+        )
+
+        assert "=== AI NEWS DAILY DIGEST ===" in text_out
+        assert "1 Curated AI Intelligence Developments" in text_out
+        assert "#1 Breakthrough in Multi-Agent Planning" in text_out
+        assert "[AI Agents] Source: ArXiv" in text_out
+        assert "Why it matters: Reduces reasoning latency by 4x." in text_out
+        assert "https://arxiv.org/abs/2609.12345" in text_out
+        assert "Unsubscribe: https://api.test/unsubscribe?token=abc" in text_out
+
+    def test_welcome_email_service_rendering(self):
+        """WelcomeEmailService produces branded HTML and plain-text output with subscriber details."""
+        welcome_service = WelcomeEmailService(email_provider=MockEmailProvider())
+        sub = Subscriber(
+            id=uuid.uuid4(),
+            email="welcome_user@example.com",
+            name="Alex",
+            topics=["Robotics", "Autonomous Agents"],
+            preferred_channel="EMAIL",
+            frequency="DAILY",
+            is_active=True,
+            unsubscribe_token="token_alex_welcome",
+        )
+
+        html_out = welcome_service.render_welcome_html(sub)
+        assert "SUBSCRIPTION CONFIRMED" in html_out
+        assert "Welcome to AI News Intelligence" in html_out
+        assert "Hello Alex," in html_out
+        assert "Robotics, Autonomous Agents" in html_out
+        assert "03:30 UTC" in html_out
+        assert "token_alex_welcome" in html_out
+        assert "You'll receive your AI news digest every day at your selected time." in html_out
+        assert "AI News / Portfolio" in html_out
+        assert "Manage Preferences" in html_out
+
+        text_out = welcome_service.render_welcome_plain_text(sub)
+        assert "=== WELCOME TO AI NEWS INTELLIGENCE ===" in text_out
+        assert "You're subscribed to AI News Intelligence" in text_out
+        assert "Hello Alex," in text_out
+        assert "Robotics, Autonomous Agents" in text_out
+        assert "token_alex_welcome" in text_out
+        assert "You'll receive your AI news digest every day at your selected time." in text_out
+        assert "AI News / Portfolio" in text_out
+        assert "Manage Preferences" in text_out
+
+    @pytest.mark.asyncio
+    async def test_welcome_email_subject_is_canonical(self):
+        """send_welcome_email uses exact canonical subject 'You're subscribed to AI News Intelligence'."""
+        mock_provider = MockEmailProvider()
+        welcome_service = WelcomeEmailService(email_provider=mock_provider)
+        sub = Subscriber(
+            id=uuid.uuid4(),
+            email="subscriber@example.com",
+            name="Dev",
+            topics=["Agents"],
+            preferred_channel="EMAIL",
+            frequency="DAILY",
+            is_active=True,
+            unsubscribe_token="token_dev_123",
+        )
+        res = await welcome_service.send_welcome_email(sub)
+        assert res.success is True
+        assert len(mock_provider.sent_messages) == 1
+        assert mock_provider.sent_messages[0]["subject"] == "You're subscribed to AI News Intelligence"
+        assert mock_provider.sent_messages[0]["to"] == "subscriber@example.com"
+
+
+class TestDailyDispatchDryRunAndCLI:
+    """Test dry-run safety and CLI runner exit codes."""
+
+    @pytest.mark.asyncio
+    async def test_cli_exit_code_on_success(self):
+        """When DailyDispatchService returns status='success', _run_cli exits normally without error."""
+        mock_response = MagicMock(
+            status="success",
+            digest_id=uuid.uuid4(),
+            digest_stories_count=5,
+            total_subscribers=2,
+            sent_count=2,
+            skipped_count=0,
+            failed_count=0,
+            duration_seconds=1.5,
+        )
+
+        with patch("sys.argv", ["run_daily_dispatch.py"]), \
+             patch("app.services.dispatch_service.AsyncSessionLocal"), \
+             patch("app.services.dispatch_service.DailyDispatchService.run_daily_dispatch", new_callable=AsyncMock) as mock_dispatch:
+            mock_dispatch.return_value = mock_response
+            # Should complete cleanly without raising SystemExit
+            await _run_cli()
+            mock_dispatch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cli_exit_code_on_error_status(self):
+        """When DailyDispatchService returns status='error', _run_cli exits with code 1."""
+        mock_response = MagicMock(
+            status="error",
+            digest_id=uuid.uuid4(),
+            digest_stories_count=5,
+            total_subscribers=2,
+            sent_count=0,
+            skipped_count=0,
+            failed_count=2,
+            duration_seconds=1.2,
+        )
+
+        with patch("sys.argv", ["run_daily_dispatch.py"]), \
+             patch("app.services.dispatch_service.AsyncSessionLocal"), \
+             patch("app.services.dispatch_service.DailyDispatchService.run_daily_dispatch", new_callable=AsyncMock) as mock_dispatch:
+            mock_dispatch.return_value = mock_response
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_cli()
+            assert exc_info.value.code == 1
+
+    @pytest.mark.asyncio
+    async def test_cli_exit_code_on_fatal_exception(self):
+        """When an unhandled exception occurs in _run_cli, it exits with code 1."""
+        with patch("sys.argv", ["run_daily_dispatch.py"]), \
+             patch("app.services.dispatch_service.AsyncSessionLocal"), \
+             patch("app.services.dispatch_service.DailyDispatchService.run_daily_dispatch", new_callable=AsyncMock) as mock_dispatch:
+            mock_dispatch.side_effect = RuntimeError("Fatal DB crash")
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_cli()
+            assert exc_info.value.code == 1
+
+    @pytest.mark.asyncio
+    async def test_full_daily_pipeline_orchestration(self):
+        """Full DailyDispatchService orchestrates source guard, pipeline pass, digest, and delivery."""
+        mock_session = AsyncMock()
+        mock_pipeline = AsyncMock()
+        mock_digest = AsyncMock()
+        mock_delivery = AsyncMock()
+
+        mock_pipeline_res = MagicMock(
+            status="SUCCESS",
+            items_processed=10,
+            ai_analyses_performed=5,
+            embeddings_generated=5,
+            embeddings_reused=2,
+            stories_ranked=5,
+            stories_curated=5,
+            duration_ms=1200.0,
+        )
+        mock_pipeline.run_pipeline.return_value = mock_pipeline_res
+
+        digest_id = uuid.uuid4()
+        fake_digest = Digest(
+            id=digest_id,
+            title="AI News Daily Digest — October 14, 2026",
+            digest_date=date(2026, 10, 14),
+            story_count=5,
+            status="PUBLISHED",
+            html_content="<html>Content</html>",
+            plain_text_content="Content",
+        )
+        mock_digest.generate_daily_digest.return_value = fake_digest
+
+        mock_delivery_res = MagicMock(
+            digest_id=digest_id,
+            total_subscribers=3,
+            sent_count=3,
+            skipped_count=0,
+            failed_count=0,
+        )
+        mock_delivery.send_digest.return_value = mock_delivery_res
+
+        service = DailyDispatchService(
+            session=mock_session,
+            pipeline_service=mock_pipeline,
+            digest_service=mock_digest,
+            delivery_service=mock_delivery,
+        )
+
+        # Simulate sources exist in DB
+        with patch("app.infrastructure.repositories.source_repo.SourceRepository.list_enabled", new_callable=AsyncMock) as mock_list_src:
+            mock_list_src.return_value = [MagicMock()]
+            res = await service.run_daily_dispatch(DailyDispatchRequest(run_ingestion=True))
+
+        assert res.status == "success"
+        assert res.digest_id == digest_id
+        assert res.digest_stories_count == 5
+        assert res.total_subscribers == 3
+        assert res.sent_count == 3
+        assert res.failed_count == 0
+        mock_pipeline.run_pipeline.assert_called_once()
+        mock_digest.generate_daily_digest.assert_called_once()
+        mock_delivery.send_digest.assert_called_once_with(digest_id=digest_id, dry_run=False)
+
+
+class TestNeonPostgreSQLConfigurationAndCompatibility:
+    """Test Neon PostgreSQL URL resolution, driver adaptation, and connection pooling."""
+
+    def test_neon_pooled_database_url_translation(self):
+        """Neon pooled URL is translated to asyncpg driver with ssl=require."""
+        s = Settings(
+            DATABASE_URL="postgresql://neondb_owner:npg_secret123@ep-cool-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+        )
+        async_url = s.async_database_url
+        assert async_url.startswith("postgresql+asyncpg://")
+        assert "ssl=require" in async_url
+        assert "sslmode" not in async_url
+        assert "-pooler." in async_url
+        assert "npg_secret123" in async_url
+
+    def test_neon_postgres_scheme_translation(self):
+        """postgres:// scheme is properly translated to postgresql+asyncpg://."""
+        s = Settings(
+            DATABASE_URL="postgres://neondb_owner:npg_secret123@ep-cool-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+        )
+        async_url = s.async_database_url
+        assert async_url.startswith("postgresql+asyncpg://")
+        assert "ssl=require" in async_url
+
+    def test_neon_migration_database_url_strips_pooler(self):
+        """Alembic migration URL strips -pooler. to bypass PgBouncer transaction pooling during DDL."""
+        s = Settings(
+            DATABASE_URL="postgresql://neondb_owner:npg_secret123@ep-cool-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+        )
+        mig_url = s.migration_database_url
+        assert mig_url.startswith("postgresql+asyncpg://")
+        assert "-pooler." not in mig_url
+        assert "ep-cool.ap-southeast-1.aws.neon.tech" in mig_url
+        assert "ssl=require" in mig_url
+
+    def test_neon_direct_database_url_override(self):
+        """Direct database URL takes precedence for migrations when explicitly provided."""
+        s = Settings(
+            DATABASE_URL="postgresql://neondb_owner:npg_secret123@ep-cool-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require",
+            DIRECT_DATABASE_URL="postgresql://neondb_owner:npg_secret123@ep-direct-compute.ap-southeast-1.aws.neon.tech/neondb?sslmode=require",
+        )
+        mig_url = s.migration_database_url
+        assert "ep-direct-compute" in mig_url
+        assert mig_url.startswith("postgresql+asyncpg://")
+        assert "ssl=require" in mig_url
+
+    def test_neon_sync_database_url_preserves_sslmode(self):
+        """Sync connection URL maintains postgresql:// and sslmode parameter for libpq/psycopg."""
+        s = Settings(
+            DATABASE_URL="postgresql+asyncpg://neondb_owner:npg_secret123@ep-cool.ap-southeast-1.aws.neon.tech/neondb?ssl=require"
+        )
+        sync_url = s.sync_database_url
+        assert sync_url.startswith("postgresql://")
+        assert "sslmode=require" in sync_url
+
+    def test_neon_connection_pool_defaults(self):
+        """Connection pool settings are configured with safe limits and 5-min recycle for Neon Free."""
+        s = Settings(_env_file=None)
+        assert s.DB_POOL_RECYCLE == 300
+        assert s.DB_POOL_SIZE == 5
+        assert s.DB_MAX_OVERFLOW == 10
+        assert s.DB_POOL_TIMEOUT == 30.0
+        assert Settings.model_fields["DB_POOL_RECYCLE"].default == 300
+        assert Settings.model_fields["DB_POOL_SIZE"].default == 5
+        assert Settings.model_fields["DB_MAX_OVERFLOW"].default == 10

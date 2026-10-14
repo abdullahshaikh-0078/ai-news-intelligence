@@ -1,8 +1,8 @@
 from datetime import date, datetime
 import re
-from typing import List, Optional
+from typing import Any, List, Optional
 import uuid
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -15,6 +15,16 @@ class SubscribeRequest(BaseModel):
     frequency: Optional[str] = Field("DAILY", max_length=50)
     preferred_channel: Optional[str] = Field("EMAIL", max_length=50)
     topics: Optional[List[str]] = Field(default_factory=list)
+    timezone: Optional[str] = Field(None, max_length=100, description="Subscriber timezone")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Accept 'channel' alias if 'preferred_channel' is not explicitly provided
+            if "channel" in data and "preferred_channel" not in data:
+                data["preferred_channel"] = data["channel"]
+        return data
 
     @field_validator("email")
     @classmethod
@@ -32,6 +42,7 @@ class SubscribeResponse(BaseModel):
     email: str
     is_active: bool
     created: bool
+    reactivated: bool = False
 
 
 class UnsubscribeRequest(BaseModel):
@@ -64,6 +75,15 @@ class PreferencesUpdateRequest(BaseModel):
     frequency: Optional[str] = Field(None, max_length=50)
     preferred_channel: Optional[str] = Field(None, max_length=50)
     topics: Optional[List[str]] = None
+    timezone: Optional[str] = Field(None, max_length=100, description="Subscriber timezone")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "channel" in data and "preferred_channel" not in data:
+                data["preferred_channel"] = data["channel"]
+        return data
 
     @field_validator("email")
     @classmethod

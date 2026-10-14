@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 import json
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -112,20 +112,99 @@ class Settings(BaseSettings):
 
         return cleaned
 
-    # Canonical Database Configuration (Single Source of Truth)
+    # Canonical Database Configuration (Single Source of Truth, compatible with Neon PostgreSQL)
     DATABASE_URL: str = "postgresql+asyncpg://postgres@localhost:5433/ai_news_intel"
+    DIRECT_DATABASE_URL: Optional[str] = None
     TEST_DATABASE_URL: str = "postgresql+asyncpg://postgres@localhost:5433/ai_news_intel_test"
-    DB_POOL_SIZE: int = 10
-    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: float = 30.0
+    DB_POOL_RECYCLE: int = 300  # 5 minutes, matching Neon auto-suspend window
     DB_ECHO: bool = False
+
+    @property
+    def async_database_url(self) -> str:
+        """
+        Derive asyncpg connection URL (postgresql+asyncpg://) compatible with asyncpg.
+        Normalizes postgres:// and postgresql:// protocols and translates query parameter sslmode -> ssl.
+        """
+        url = self.DATABASE_URL
+        if not url:
+            return url
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        elif url.startswith("postgresql+psycopg://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql+psycopg://"):]
+        elif url.startswith("postgresql+psycopg2://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://"):]
+
+        # Translate sslmode to ssl for asyncpg compatibility (preventing 'unexpected keyword argument sslmode')
+        url = url.replace("sslmode=require", "ssl=require")
+        url = url.replace("sslmode=verify-full", "ssl=verify-full")
+        url = url.replace("sslmode=verify-ca", "ssl=verify-ca")
+        url = url.replace("sslmode=prefer", "ssl=prefer")
+        url = url.replace("sslmode=disable", "ssl=disable")
+
+        # Strip libpq-specific channel_binding parameter not supported by asyncpg
+        import re
+        url = re.sub(r"([?&])channel_binding=[^&]*(&|$)", r"\1", url)
+        url = re.sub(r"[?&]$", "", url)
+        if "?" not in url and "&" in url:
+            url = url.replace("&", "?", 1)
+        return url
 
     @property
     def sync_database_url(self) -> str:
         """Derive standard psycopg/sync connection URL for Alembic or sync tools."""
         url = self.DATABASE_URL
+        if not url:
+            return url
         if url.startswith("postgresql+asyncpg://"):
-            return url.replace("postgresql+asyncpg://", "postgresql://")
+            url = "postgresql://" + url[len("postgresql+asyncpg://"):]
+        elif url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+
+        # Ensure libpq/psycopg sync drivers retain sslmode parameter
+        url = url.replace("ssl=require", "sslmode=require")
+        url = url.replace("ssl=verify-full", "sslmode=verify-full")
+        url = url.replace("ssl=verify-ca", "sslmode=verify-ca")
+        return url
+
+    @property
+    def migration_database_url(self) -> str:
+        """
+        Derive direct connection URL for Alembic migrations.
+        Uses DIRECT_DATABASE_URL if configured, or automatically strips '-pooler' from Neon host
+        to bypass PgBouncer transaction pooling during DDL migrations.
+        """
+        raw = self.DIRECT_DATABASE_URL or self.DATABASE_URL
+        if not raw:
+            return self.async_database_url
+        if not self.DIRECT_DATABASE_URL and "-pooler." in raw:
+            raw = raw.replace("-pooler.", ".")
+
+        url = raw
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        elif url.startswith("postgresql+psycopg://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql+psycopg://"):]
+        elif url.startswith("postgresql+psycopg2://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://"):]
+
+        url = url.replace("sslmode=require", "ssl=require")
+        url = url.replace("sslmode=verify-full", "ssl=verify-full")
+        url = url.replace("sslmode=verify-ca", "ssl=verify-ca")
+
+        # Strip libpq-specific channel_binding parameter not supported by asyncpg
+        import re
+        url = re.sub(r"([?&])channel_binding=[^&]*(&|$)", r"\1", url)
+        url = re.sub(r"[?&]$", "", url)
+        if "?" not in url and "&" in url:
+            url = url.replace("&", "?", 1)
         return url
 
     # AI / LLM Configuration (Google Gemini)

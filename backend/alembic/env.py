@@ -17,7 +17,7 @@ if config.config_file_name is not None:
 
 # Overwrite sqlalchemy.url with the app setting if not explicitly overridden
 if not config.get_main_option("sqlalchemy.url") or config.get_main_option("sqlalchemy.url").startswith("driver://"):
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+    config.set_main_option("sqlalchemy.url", settings.migration_database_url.replace("%", "%%"))
 
 # Target metadata for 'autogenerate' support
 target_metadata = Base.metadata

@@ -174,23 +174,30 @@ async def _run_cli():
     parser.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD)")
     args = parser.parse_args()
 
-    target_date = date.fromisoformat(args.date) if args.date else None
-    req = DailyDispatchRequest(
-        target_date=target_date,
-        run_ingestion=not args.no_ingest,
-        dry_run=args.dry_run,
-        force_regenerate_digest=args.force,
-    )
+    try:
+        target_date = date.fromisoformat(args.date) if args.date else None
+        req = DailyDispatchRequest(
+            target_date=target_date,
+            run_ingestion=not args.no_ingest,
+            dry_run=args.dry_run,
+            force_regenerate_digest=args.force,
+        )
 
-    async with AsyncSessionLocal() as session:
-        service = DailyDispatchService(session=session)
-        res = await service.run_daily_dispatch(req)
-        print(f"Daily Dispatch Outcome: {res.status}")
-        print(f"Digest ID: {res.digest_id} ({res.digest_stories_count} stories)")
-        print(f"Subscribers: total={res.total_subscribers}, sent={res.sent_count}, skipped={res.skipped_count}, failed={res.failed_count}")
-        print(f"Duration: {res.duration_seconds}s")
-        if res.status == "error":
-            sys.exit(1)
+        async with AsyncSessionLocal() as session:
+            service = DailyDispatchService(session=session)
+            res = await service.run_daily_dispatch(req)
+            print(f"Daily Dispatch Outcome: {res.status}")
+            print(f"Digest ID: {res.digest_id} ({res.digest_stories_count} stories)")
+            print(f"Subscribers: total={res.total_subscribers}, sent={res.sent_count}, skipped={res.skipped_count}, failed={res.failed_count}")
+            print(f"Duration: {res.duration_seconds}s")
+            if res.status == "error":
+                sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.error(f"Fatal error during CLI daily dispatch execution: {exc}")
+        print(f"Daily Dispatch Fatal Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

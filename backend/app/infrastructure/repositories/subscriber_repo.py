@@ -45,6 +45,7 @@ class SubscriberRepository(BaseRepository[Subscriber]):
         existing = await self.get_by_email(clean_email)
 
         if existing:
+            was_inactive = not existing.is_active
             # Update fields if provided
             if name is not None:
                 existing.name = name.strip() or None
@@ -58,10 +59,11 @@ class SubscriberRepository(BaseRepository[Subscriber]):
                 existing.topics = topics
 
             # Reactivate if previously inactive
-            if not existing.is_active:
+            if was_inactive:
                 existing.is_active = True
                 existing.unsubscribed_at = None
 
+            setattr(existing, "_was_reactivated", was_inactive)
             self.session.add(existing)
             await self.session.flush()
             return existing, False
@@ -78,6 +80,7 @@ class SubscriberRepository(BaseRepository[Subscriber]):
             is_active=True,
             unsubscribe_token=token,
         )
+        setattr(subscriber, "_was_reactivated", False)
         self.session.add(subscriber)
         await self.session.flush()
         return subscriber, True

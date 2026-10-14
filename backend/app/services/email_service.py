@@ -36,6 +36,7 @@ class BaseEmailProvider(ABC):
         html_content: str,
         text_content: Optional[str] = None,
         reply_to: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> EmailSendResult:
         """Send a single email message."""
         pass
@@ -62,8 +63,9 @@ class ResendEmailProvider(BaseEmailProvider):
         html_content: str,
         text_content: Optional[str] = None,
         reply_to: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> EmailSendResult:
-        """Send email via Resend API with comprehensive failure isolation."""
+        """Send email via Resend API with comprehensive failure isolation and idempotency."""
         if not self.api_key:
             logger.error("Resend API key is not configured.")
             return EmailSendResult(
@@ -76,6 +78,8 @@ class ResendEmailProvider(BaseEmailProvider):
             "Content-Type": "application/json",
             "User-Agent": "AINewsIntelligence/1.0",
         }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
 
         payload: Dict[str, Any] = {
             "from": self.from_email,
@@ -95,7 +99,7 @@ class ResendEmailProvider(BaseEmailProvider):
                 if response.status_code in (200, 201):
                     data = response.json()
                     message_id = data.get("id")
-                    logger.info(f"Email sent successfully via Resend to {to_email} (id={message_id})")
+                    logger.info(f"Email sent successfully via Resend to recipient (id={message_id})")
                     return EmailSendResult(
                         success=True,
                         provider_message_id=message_id,
@@ -132,6 +136,7 @@ class MockEmailProvider(BaseEmailProvider):
         html_content: str,
         text_content: Optional[str] = None,
         reply_to: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> EmailSendResult:
         """Simulate email send."""
         if not self.should_succeed:
@@ -147,12 +152,250 @@ class MockEmailProvider(BaseEmailProvider):
             "html": html_content,
             "text": text_content,
             "reply_to": reply_to,
+            "idempotency_key": idempotency_key,
             "id": mock_id,
             "sent_at": datetime.now(timezone.utc),
         })
         return EmailSendResult(
             success=True,
             provider_message_id=mock_id,
+        )
+
+
+class WelcomeEmailService:
+    """Service for compiling and sending immediate confirmation welcome emails upon subscription."""
+
+    def __init__(self, email_provider: Optional[BaseEmailProvider] = None):
+        if email_provider:
+            self.email_provider = email_provider
+        elif settings.RESEND_API_KEY:
+            self.email_provider = ResendEmailProvider()
+        else:
+            self.email_provider = MockEmailProvider()
+
+    def render_welcome_html(
+        self,
+        subscriber: Subscriber,
+        app_url: Optional[str] = None,
+        unsubscribe_url: Optional[str] = None,
+        preferences_url: Optional[str] = None,
+    ) -> str:
+        """Render responsive, dark-mode HTML welcome email."""
+        import html
+        effective_app_url = app_url or settings.effective_newsletter_base_url
+        effective_unsub_url = (
+            unsubscribe_url
+            or f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={subscriber.unsubscribe_token}"
+        )
+        effective_pref_url = preferences_url or f"{effective_app_url}#customize-newsletter"
+
+        topics_display = (
+            ", ".join(subscriber.topics)
+            if subscriber.topics
+            else "All AI Intelligence Topics"
+        )
+        channel_display = getattr(subscriber, "preferred_channel", "EMAIL") or "EMAIL"
+        frequency_display = getattr(subscriber, "frequency", "DAILY") or "DAILY"
+
+        safe_name = html.escape(subscriber.name) if subscriber.name else "there"
+        safe_topics = html.escape(topics_display)
+        safe_channel = html.escape(channel_display)
+        safe_frequency = html.escape(frequency_display)
+
+        return f"""<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to AI News Intelligence</title>
+  <style>
+    body, table, td, a {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+    table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+    body {{ height: 100% !important; margin: 0 !important; padding: 0 !important; width: 100% !important; background-color: #0b0f19; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #e2e8f0; }}
+    @media only screen and (max-width: 640px) {{
+      .email-container {{ width: 100% !important; border-radius: 0 !important; border: none !important; }}
+      .header, .content, .footer {{ padding-left: 20px !important; padding-right: 20px !important; }}
+    }}
+  </style>
+</head>
+<body style="background-color: #0b0f19; margin: 0; padding: 0;">
+  <!-- Preheader snippet -->
+  <div style="display: none; max-height: 0px; overflow: hidden; font-size: 1px; line-height: 1px; color: #fff; opacity: 0;">
+    Your subscription to AI News Intelligence is confirmed. Here is what to expect from your daily briefing.
+  </div>
+  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #0b0f19; padding: 24px 0;">
+    <tr>
+      <td align="center">
+        <div class="email-container" style="max-width: 600px; margin: 0 auto; background-color: #0f172a; border-radius: 12px; overflow: hidden; border: 1px solid #1e293b; text-align: left;">
+          <!-- Header -->
+          <div class="header" style="padding: 36px 32px 24px; border-bottom: 1px solid #1e293b; background: linear-gradient(180deg, #111c35 0%, #0f172a 100%);">
+            <div style="display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; background-color: rgba(56, 189, 248, 0.12); color: #38bdf8; margin-bottom: 12px;">
+              SUBSCRIPTION CONFIRMED
+            </div>
+            <h1 style="font-size: 24px; font-weight: 800; color: #f8fafc; margin: 0 0 8px 0; line-height: 1.3;">
+              Welcome to AI News Intelligence
+            </h1>
+            <p style="font-size: 14px; color: #94a3b8; margin: 0; line-height: 1.5;">
+              High-signal breakthroughs across Autonomous Agents, Foundation Models, and Engineering Systems.
+            </p>
+          </div>
+
+            <!-- Content -->
+          <div class="content" style="padding: 32px 32px 24px;">
+            <p style="font-size: 15px; line-height: 1.6; color: #f1f5f9; margin: 0 0 20px 0;">
+              Hello {safe_name},
+            </p>
+            <p style="font-size: 14px; line-height: 1.6; color: #cbd5e1; margin: 0 0 24px 0;">
+              Thank you for subscribing to AI News Intelligence! You'll receive your AI news digest every day at your selected time.
+            </p>
+
+            <!-- Preferences Box -->
+            <div style="background-color: #1e293b; border-radius: 8px; border: 1px solid #334155; padding: 20px; margin-bottom: 24px;">
+              <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #38bdf8; margin-bottom: 12px;">
+                Your Active Subscription Profile
+              </div>
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="padding: 6px 0; font-size: 13px; color: #94a3b8; width: 140px; font-weight: 500;">Delivery Schedule:</td>
+                  <td style="padding: 6px 0; font-size: 13px; color: #f8fafc; font-weight: 600;">{safe_frequency} (03:30 UTC / 09:00 AM IST)</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; font-size: 13px; color: #94a3b8; font-weight: 500;">Channel:</td>
+                  <td style="padding: 6px 0; font-size: 13px; color: #f8fafc; font-weight: 600;">{safe_channel}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; font-size: 13px; color: #94a3b8; font-weight: 500;">Topics of Interest:</td>
+                  <td style="padding: 6px 0; font-size: 13px; color: #38bdf8; font-weight: 600;">{safe_topics}</td>
+                </tr>
+              </table>
+            </div>
+
+            <!-- What to expect -->
+            <div style="margin-bottom: 28px;">
+              <h2 style="font-size: 16px; font-weight: 700; color: #f1f5f9; margin: 0 0 10px 0;">
+                When to expect your first newsletter
+              </h2>
+              <p style="font-size: 14px; line-height: 1.6; color: #94a3b8; margin: 0 0 12px 0;">
+                Our autonomous intelligence pipeline runs daily at <strong>03:30 UTC (09:00 AM IST)</strong>, collecting, deduplicating, and synthesizing emerging AI developments.
+              </p>
+              <p style="font-size: 13px; line-height: 1.5; color: #64748b; margin: 0;">
+                If today's daily issue has already been delivered, your first briefing will arrive on tomorrow's scheduled morning cycle. Each issue delivers 5–10 highly relevant stories matching your selected areas of focus.
+              </p>
+            </div>
+
+            <!-- CTA -->
+            <div style="text-align: center; margin: 32px 0 16px;">
+              <a href="{effective_app_url}" style="display: inline-block; padding: 12px 28px; background-color: #0284c7; color: #ffffff; text-decoration: none; font-size: 14px; font-weight: 600; border-radius: 8px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);" target="_blank" rel="noopener noreferrer">
+                Explore AI News / Portfolio &rarr;
+              </a>
+            </div>
+          </div>
+
+          <!-- Footer -->
+          <div class="footer" style="padding: 24px 32px; background-color: #090d16; text-align: center; border-top: 1px solid #1e293b;">
+            <p style="font-size: 12px; color: #64748b; margin: 0 0 10px 0; line-height: 1.5;">
+              AI News Intelligence Platform • Autonomous AI News Pipeline<br>
+              Curated by Abdullah Shaikh • AI & Autonomous Systems
+            </p>
+            <div style="font-size: 12px;">
+              <a href="{effective_pref_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">Manage Preferences</a> &bull;
+              <a href="{effective_app_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">AI News / Portfolio</a> &bull;
+              <a href="{effective_unsub_url}" style="color: #38bdf8; text-decoration: none; margin: 0 8px;">Unsubscribe</a>
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+    def render_welcome_plain_text(
+        self,
+        subscriber: Subscriber,
+        app_url: Optional[str] = None,
+        unsubscribe_url: Optional[str] = None,
+        preferences_url: Optional[str] = None,
+    ) -> str:
+        """Render plain-text welcome confirmation."""
+        effective_app_url = app_url or settings.effective_newsletter_base_url
+        effective_unsub_url = (
+            unsubscribe_url
+            or f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={subscriber.unsubscribe_token}"
+        )
+        effective_pref_url = preferences_url or f"{effective_app_url}#customize-newsletter"
+
+        topics_display = (
+            ", ".join(subscriber.topics)
+            if subscriber.topics
+            else "All AI Intelligence Topics"
+        )
+        channel_display = getattr(subscriber, "preferred_channel", "EMAIL") or "EMAIL"
+        frequency_display = getattr(subscriber, "frequency", "DAILY") or "DAILY"
+        name_display = subscriber.name if subscriber.name else "there"
+
+        lines = [
+            "=== WELCOME TO AI NEWS INTELLIGENCE ===",
+            "You're subscribed to AI News Intelligence",
+            "=" * 50,
+            "",
+            f"Hello {name_display},",
+            "",
+            "Thank you for subscribing to AI News Intelligence.",
+            "You'll receive your AI news digest every day at your selected time.",
+            "",
+            "YOUR SUBSCRIPTION PROFILE:",
+            f"- Delivery Schedule: {frequency_display} (03:30 UTC / 09:00 AM IST)",
+            f"- Channel: {channel_display}",
+            f"- Topics: {topics_display}",
+            "",
+            "WHEN TO EXPECT YOUR FIRST NEWSLETTER:",
+            "Our autonomous intelligence pipeline runs daily at 03:30 UTC (09:00 AM IST).",
+            "If today's daily issue has already been delivered, your first briefing will arrive",
+            "on tomorrow's scheduled morning cycle.",
+            "",
+            "=" * 50,
+            f"Manage Preferences: {effective_pref_url}",
+            f"AI News / Portfolio: {effective_app_url}",
+            f"Unsubscribe: {effective_unsub_url}",
+        ]
+        return "\n".join(lines)
+
+    async def send_welcome_email(
+        self,
+        subscriber: Subscriber,
+        app_url: Optional[str] = None,
+        unsubscribe_url: Optional[str] = None,
+        preferences_url: Optional[str] = None,
+    ) -> EmailSendResult:
+        """
+        Send immediate welcome email confirmation to the subscriber.
+        Uses idempotency key based on subscriber UUID to prevent duplicate messages.
+        """
+        if not subscriber.email:
+            return EmailSendResult(success=False, error_message="Subscriber has no email address")
+
+        subject = "You're subscribed to AI News Intelligence"
+        html_content = self.render_welcome_html(
+            subscriber=subscriber,
+            app_url=app_url,
+            unsubscribe_url=unsubscribe_url,
+            preferences_url=preferences_url,
+        )
+        text_content = self.render_welcome_plain_text(
+            subscriber=subscriber,
+            app_url=app_url,
+            unsubscribe_url=unsubscribe_url,
+            preferences_url=preferences_url,
+        )
+
+        idempotency_key = f"welcome-{subscriber.id}"
+        return await self.email_provider.send_email(
+            to_email=subscriber.email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            idempotency_key=idempotency_key,
         )
 
 
@@ -380,6 +623,7 @@ class DeliveryService:
                 f"{settings.public_api_v1_url}/newsletter/unsubscribe?token={sub.unsubscribe_token}"
             )
             preferences_link = f"{settings.effective_newsletter_base_url}#customize-newsletter"
+            app_link = settings.effective_newsletter_base_url
 
             # Render customized HTML/text if subscriber has personalized topic subset
             if has_topic_preference and matched_stories and len(matched_stories) < len(curated_stories):
@@ -389,21 +633,26 @@ class DeliveryService:
                     stories=matched_stories,
                     unsubscribe_url=unsubscribe_link,
                     preferences_url=preferences_link,
+                    app_url=app_link,
                 )
                 personalized_text = self.digest_service.render_plain_text_digest(
                     title=title,
                     issue_date=digest.digest_date,
                     stories=matched_stories,
                     unsubscribe_url=unsubscribe_link,
+                    preferences_url=preferences_link,
+                    app_url=app_link,
                 )
             else:
                 personalized_html = (
                     html_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
                     .replace("{{ preferences_url }}", preferences_link)
+                    .replace("{{ app_url }}", app_link)
                 )
                 personalized_text = (
                     plain_text_content.replace("{{ unsubscribe_url }}", unsubscribe_link)
                     .replace("{{ preferences_url }}", preferences_link)
+                    .replace("{{ app_url }}", app_link)
                 )
 
             # Attempt external email send with fault isolation

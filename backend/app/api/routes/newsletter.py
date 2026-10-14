@@ -35,18 +35,22 @@ async def subscribe_to_newsletter(
     """Subscribe a new user or update preferences for an existing subscriber idempotently."""
     service = SubscriberService(session=session)
     subscriber, is_created = await service.subscribe(request)
+    was_reactivated = getattr(subscriber, "_was_reactivated", False)
     
-    msg = (
-        "You're in. Your AI News digest will be delivered to your inbox."
-        if is_created
-        else "Welcome back! Your subscription preferences have been updated."
-    )
+    if is_created:
+        msg = "You're in! Welcome to AI News Intelligence. Your confirmation email is on its way."
+    elif was_reactivated:
+        msg = "Welcome back! Your subscription to AI News Intelligence has been reactivated."
+    else:
+        msg = "Welcome back! Your subscription preferences have been updated."
+
     return SubscribeResponse(
         status="success",
         message=msg,
         email=subscriber.email,
         is_active=subscriber.is_active,
         created=is_created,
+        reactivated=was_reactivated,
     )
 
 
