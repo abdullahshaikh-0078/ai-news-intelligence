@@ -27,4 +27,5 @@ def test_alembic_configuration_and_revisions():
     assert "d6f7a8b9c0d1" in revisions, "Phase 12/13 schema migration should be registered"
     assert "e7f8a9b0c1d2" in revisions, "Phase 17 schema migration should be registered"
     assert "f8a9b0c1d2e3" in revisions, "Phase 18 schema migration should be registered"
-    assert "f8a9b0c1d2e3" in heads, "Phase 18 migration should be current head"
+    assert "a1b2c3d4e5f6" in revisions, "Subscriber schedule schema migration should be registered"
+    assert "a1b2c3d4e5f6" in heads, "Subscriber schedule migration should be current head"

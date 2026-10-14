@@ -263,12 +263,24 @@ class Settings(BaseSettings):
     DIGEST_MAX_STORIES: int = 10
     DELIVERY_CLAIM_TIMEOUT_SECONDS: int = 900
 
+    # Retention / Safe Cleanup Configuration
+    NEWS_RETENTION_DAYS: int = 90
+    DELIVERY_RECORD_RETENTION_DAYS: int = 180
+    RETENTION_BATCH_SIZE: int = 500
+
+    # Due Window & Scheduling Defaults
+    DELIVERY_DUE_WINDOW_MINUTES: int = 60
+    DEFAULT_DELIVERY_TIME: str = "08:00"
+    DEFAULT_TIMEZONE: str = "Asia/Kolkata"
+
     # Resend Webhooks & Dispatch Configuration (Phase 18)
     RESEND_WEBHOOK_SECRET: str | None = None
     DISPATCH_SECRET_TOKEN: str | None = None
     DISPATCH_CRON_ENABLED: bool = False
     DISPATCH_SCHEDULE_HOUR_UTC: int = 3
     DISPATCH_SCHEDULE_MINUTE_UTC: int = 30
+    DISPATCH_SCHEDULER_FREQUENCY: str = "0 * * * *"  # Recommended hourly scheduler
+    NEWS_COLLECTION_SCHEDULE_UTC: str = "03:30"
 
     # External Service Keys
     YOUTUBE_API_KEY: str | None = None

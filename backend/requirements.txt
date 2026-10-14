@@ -15,4 +15,4 @@ python-dateutil>=2.9.0
 beautifulsoup4>=4.12.0
 pgvector>=0.3.0
 google-genai>=2.22.0
-
+tzdata>=2024.1

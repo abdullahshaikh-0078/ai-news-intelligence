@@ -12,7 +12,7 @@ class CuratedStoryResponse(BaseModel):
     summary: Optional[str] = None
     key_takeaway: Optional[str] = None
     why_it_matters: Optional[str] = None
-    ranking_score: float = Field(ge=0.0, le=1.0)
+    ranking_score: float = Field(default=0.0, ge=0.0, le=1.0)
     category: Optional[str] = None
     topics: List[str] = Field(default_factory=list)
     canonical_url: Optional[str] = None

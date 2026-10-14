@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -196,11 +197,19 @@ class WelcomeEmailService:
         )
         channel_display = getattr(subscriber, "preferred_channel", "EMAIL") or "EMAIL"
         frequency_display = getattr(subscriber, "frequency", "DAILY") or "DAILY"
+        preferred_time_display = getattr(subscriber, "preferred_time", "08:00") or "08:00"
+        timezone_display = getattr(subscriber, "timezone", "Asia/Kolkata") or "Asia/Kolkata"
+        preferred_weekday_display = getattr(subscriber, "preferred_weekday", "MONDAY") or "MONDAY"
+
+        if frequency_display.upper() == "WEEKLY":
+            schedule_display = f"WEEKLY on {preferred_weekday_display} at {preferred_time_display} ({timezone_display})"
+        else:
+            schedule_display = f"DAILY at {preferred_time_display} ({timezone_display})"
 
         safe_name = html.escape(subscriber.name) if subscriber.name else "there"
         safe_topics = html.escape(topics_display)
         safe_channel = html.escape(channel_display)
-        safe_frequency = html.escape(frequency_display)
+        safe_schedule = html.escape(schedule_display)
 
         return f"""<!DOCTYPE html>
 <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
@@ -257,7 +266,7 @@ class WelcomeEmailService:
               <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
                 <tr>
                   <td style="padding: 6px 0; font-size: 13px; color: #94a3b8; width: 140px; font-weight: 500;">Delivery Schedule:</td>
-                  <td style="padding: 6px 0; font-size: 13px; color: #f8fafc; font-weight: 600;">{safe_frequency} (03:30 UTC / 09:00 AM IST)</td>
+                  <td style="padding: 6px 0; font-size: 13px; color: #f8fafc; font-weight: 600;">{safe_schedule}</td>
                 </tr>
                 <tr>
                   <td style="padding: 6px 0; font-size: 13px; color: #94a3b8; font-weight: 500;">Channel:</td>
@@ -332,6 +341,14 @@ class WelcomeEmailService:
         )
         channel_display = getattr(subscriber, "preferred_channel", "EMAIL") or "EMAIL"
         frequency_display = getattr(subscriber, "frequency", "DAILY") or "DAILY"
+        preferred_time_display = getattr(subscriber, "preferred_time", "08:00") or "08:00"
+        timezone_display = getattr(subscriber, "timezone", "Asia/Kolkata") or "Asia/Kolkata"
+        preferred_weekday_display = getattr(subscriber, "preferred_weekday", "MONDAY") or "MONDAY"
+        if frequency_display.upper() == "WEEKLY":
+            schedule_display = f"WEEKLY on {preferred_weekday_display} at {preferred_time_display} ({timezone_display})"
+        else:
+            schedule_display = f"DAILY at {preferred_time_display} ({timezone_display})"
+
         name_display = subscriber.name if subscriber.name else "there"
 
         lines = [
@@ -345,7 +362,7 @@ class WelcomeEmailService:
             "You'll receive your AI news digest every day at your selected time.",
             "",
             "YOUR SUBSCRIPTION PROFILE:",
-            f"- Delivery Schedule: {frequency_display} (03:30 UTC / 09:00 AM IST)",
+            f"- Delivery Schedule: {schedule_display}",
             f"- Channel: {channel_display}",
             f"- Topics: {topics_display}",
             "",
@@ -468,23 +485,52 @@ class DeliveryService:
             )
         return curated
 
-    @staticmethod
+    @classmethod
     def _filter_stories_for_subscriber(
+        cls,
         stories: List[CuratedStoryResponse],
         subscriber_topics: Optional[List[str]],
+        content_preferences: Optional[Dict[str, Any]] = None,
     ) -> List[CuratedStoryResponse]:
-        """Filter stories to match subscriber topic preferences. If none specified, returns all stories."""
+        """Filter stories to match subscriber topic and content preferences.
+        If none specified, returns all stories.
+        """
+        candidate_stories = list(stories)
+
+        # 1. Content preferences: min_score filter and excluded_topics filter
+        pref_dict = content_preferences or {}
+        if isinstance(pref_dict, dict):
+            min_score = pref_dict.get("min_score")
+            if min_score is not None:
+                try:
+                    min_score_float = float(min_score)
+                    candidate_stories = [s for s in candidate_stories if s.ranking_score >= min_score_float]
+                except (ValueError, TypeError):
+                    pass
+
+            excluded = pref_dict.get("excluded_topics") or []
+            if isinstance(excluded, list) and excluded:
+                clean_excluded = [str(x).strip().lower() for x in excluded if str(x).strip()]
+                candidate_stories = [
+                    s for s in candidate_stories
+                    if not any(
+                        ex in (s.category or "").lower() or any(ex in str(t).lower() for t in s.topics)
+                        for ex in clean_excluded
+                    )
+                ]
+
+        # 2. Topic preference matching
         if not subscriber_topics:
-            return stories
+            return candidate_stories
 
         clean_sub_topics = [
             str(t).strip().lower() for t in subscriber_topics if isinstance(t, str) and str(t).strip()
         ]
         if not clean_sub_topics:
-            return stories
+            return candidate_stories
 
         matched: List[CuratedStoryResponse] = []
-        for s in stories:
+        for s in candidate_stories:
             story_tokens = []
             if s.category:
                 story_tokens.append(s.category.strip().lower())
@@ -506,9 +552,24 @@ class DeliveryService:
         self,
         digest_id: uuid.UUID,
         dry_run: bool = False,
+        frequency: Optional[str] = "DAILY",
+    ) -> DigestSendResponse:
+        """Dispatch a digest issue to all active subscribers matching the frequency filter."""
+        subscribers = await self.subscriber_repo.list_active(frequency=frequency)
+        return await self.send_digest_to_subscribers(
+            digest_id=digest_id,
+            subscribers=subscribers,
+            dry_run=dry_run,
+        )
+
+    async def send_digest_to_subscribers(
+        self,
+        digest_id: uuid.UUID,
+        subscribers: List[Subscriber],
+        dry_run: bool = False,
     ) -> DigestSendResponse:
         """
-        Dispatch a digest issue to all active subscribers with concurrency-safe deduplication.
+        Dispatch a digest issue to a specific list of due subscribers with concurrency-safe deduplication.
 
         Concurrency & Idempotency Architecture:
         - Atomic Claims: Acquires an atomic claim (status='PENDING') backed by the unique constraint
@@ -526,7 +587,6 @@ class DeliveryService:
         if not digest:
             raise ValueError(f"Digest issue {digest_id} not found.")
 
-        subscribers = await self.subscriber_repo.list_active(frequency="DAILY")
         total_subscribers = len(subscribers)
         sent_count = 0
         failed_count = 0
@@ -565,18 +625,21 @@ class DeliveryService:
                 skipped_count += 1
                 continue
 
-            # 2. Enforce subscriber topic personalization
+            # 2. Enforce subscriber topic and content preference personalization
             raw_topics = getattr(sub, "topics", None) or []
+            content_prefs = getattr(sub, "content_preferences", None) or {}
             sub_topics = [
                 str(t).strip().lower() for t in raw_topics if isinstance(t, str) and str(t).strip()
             ]
-            has_topic_preference = bool(sub_topics)
+            has_preference = bool(sub_topics) or bool(content_prefs)
 
-            if has_topic_preference and curated_stories:
-                matched_stories = self._filter_stories_for_subscriber(curated_stories, sub_topics)
+            if has_preference and curated_stories:
+                matched_stories = self._filter_stories_for_subscriber(
+                    curated_stories, sub_topics, content_preferences=content_prefs
+                )
                 if not matched_stories:
                     logger.info(
-                        f"Subscriber {sub.email} configured topics {sub_topics} but 0 stories matched. "
+                        f"Subscriber {sub.email} configured topics {sub_topics} and prefs {content_prefs} but 0 stories matched. "
                         "Skipping delivery to prevent delivering irrelevant or empty content."
                     )
                     skipped_count += 1
@@ -626,7 +689,7 @@ class DeliveryService:
             app_link = settings.effective_newsletter_base_url
 
             # Render customized HTML/text if subscriber has personalized topic subset
-            if has_topic_preference and matched_stories and len(matched_stories) < len(curated_stories):
+            if has_preference and matched_stories and len(matched_stories) < len(curated_stories):
                 personalized_html = self.digest_service.render_html_digest(
                     title=title,
                     issue_date=digest.digest_date,
@@ -702,7 +765,9 @@ class DeliveryService:
                 fresh_digest = await self.digest_repo.get_with_stories(digest_id)
                 if fresh_digest:
                     fresh_digest.status = "SENT"
-                    self.session.add(fresh_digest)
+                    add_res = self.session.add(fresh_digest)
+                    if asyncio.iscoroutine(add_res):
+                        await add_res
                     await self.session.commit()
 
         return DigestSendResponse(

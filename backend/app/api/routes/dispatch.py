@@ -1,7 +1,8 @@
 import hmac
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -10,8 +11,12 @@ from app.domain.models.dispatch import (
     DailyDispatchRequest,
     DailyDispatchResponse,
     DispatchStatusResponse,
+    ScheduledTickRequest,
+    ScheduledTickResponse,
 )
 from app.infrastructure.database.session import get_db
+from app.infrastructure.models.content_item import ContentItem
+from app.infrastructure.models.digest import DeliveryRecord
 from app.infrastructure.repositories.digest_repo import DigestRepository
 from app.infrastructure.repositories.subscriber_repo import SubscriberRepository
 from app.services.dispatch_service import DailyDispatchService
@@ -73,6 +78,48 @@ async def run_daily_dispatch(
     return await service.run_daily_dispatch(req)
 
 
+@router.post(
+    "/scheduler",
+    response_model=ScheduledTickResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute decoupled recurring scheduler tick (due delivery + news collection if scheduled)",
+)
+async def run_scheduled_tick(
+    request: Optional[ScheduledTickRequest] = None,
+    session: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_dispatch_auth),
+) -> ScheduledTickResponse:
+    """
+    Trigger scheduled execution tick:
+    - Ingests and curates news only on the designated collection schedule (or forced).
+    - Determines subscribers due now based on preferred delivery time and IANA timezone.
+    - Dispatches personalized digests reusing the curated story set.
+    """
+    req = request or ScheduledTickRequest()
+    service = DailyDispatchService(session=session)
+    return await service.run_scheduled_tick(req)
+
+
+@router.post(
+    "/cleanup",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+    summary="Execute safe retention cleanup cycle",
+)
+async def run_retention_cleanup(
+    news_retention_days: Optional[int] = None,
+    delivery_retention_days: Optional[int] = None,
+    session: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_dispatch_auth),
+) -> Dict[str, Any]:
+    """Manually trigger safe, non-destructive retention cleanup."""
+    service = DailyDispatchService(session=session)
+    return await service.cleanup_old_data(
+        news_retention_days=news_retention_days,
+        delivery_retention_days=delivery_retention_days,
+    )
+
+
 @router.get(
     "/status",
     response_model=DispatchStatusResponse,
@@ -86,7 +133,27 @@ async def get_dispatch_status(
     subscriber_repo = SubscriberRepository(session)
 
     latest_digest = await digest_repo.get_latest()
-    active_subs = await subscriber_repo.count_active(frequency="DAILY")
+    active_daily = await subscriber_repo.count_active(frequency="DAILY")
+    active_weekly = await subscriber_repo.count_active(frequency="WEEKLY")
+
+    # Latest successful delivery
+    latest_deliv_stmt = (
+        select(DeliveryRecord.delivered_at)
+        .where(DeliveryRecord.status == "SENT")
+        .order_by(desc(DeliveryRecord.delivered_at))
+        .limit(1)
+    )
+    latest_deliv_res = await session.execute(latest_deliv_stmt)
+    latest_delivery_at = latest_deliv_res.scalar_one_or_none()
+
+    # Latest news item collection
+    latest_item_stmt = (
+        select(ContentItem.fetched_at)
+        .order_by(desc(ContentItem.fetched_at))
+        .limit(1)
+    )
+    latest_item_res = await session.execute(latest_item_stmt)
+    latest_collection_at = latest_item_res.scalar_one_or_none()
 
     return DispatchStatusResponse(
         status="READY",
@@ -94,11 +161,18 @@ async def get_dispatch_status(
         cron_enabled=settings.DISPATCH_CRON_ENABLED,
         schedule_hour_utc=settings.DISPATCH_SCHEDULE_HOUR_UTC,
         schedule_minute_utc=settings.DISPATCH_SCHEDULE_MINUTE_UTC,
+        delivery_scheduler_frequency=settings.DISPATCH_SCHEDULER_FREQUENCY,
+        news_collection_schedule_utc=settings.NEWS_COLLECTION_SCHEDULE_UTC,
         resend_configured=bool(settings.RESEND_API_KEY),
         webhook_secret_configured=bool(settings.RESEND_WEBHOOK_SECRET),
         dispatch_token_configured=bool(settings.DISPATCH_SECRET_TOKEN),
         latest_digest_date=latest_digest.digest_date if latest_digest else None,
         latest_digest_id=latest_digest.id if latest_digest else None,
         latest_digest_stories=latest_digest.story_count if latest_digest else 0,
-        active_daily_subscribers=active_subs,
+        active_daily_subscribers=active_daily,
+        active_weekly_subscribers=active_weekly,
+        latest_delivery_at=latest_delivery_at,
+        latest_collection_at=latest_collection_at,
+        news_retention_days=settings.NEWS_RETENTION_DAYS,
+        delivery_record_retention_days=settings.DELIVERY_RECORD_RETENTION_DAYS,
     )

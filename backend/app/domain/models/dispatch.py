@@ -41,6 +41,8 @@ class DispatchStatusResponse(BaseModel):
     cron_enabled: bool
     schedule_hour_utc: int
     schedule_minute_utc: int = 30
+    delivery_scheduler_frequency: str = "0 * * * *"
+    news_collection_schedule_utc: str = "03:30"
     resend_configured: bool
     webhook_secret_configured: bool
     dispatch_token_configured: bool = False
@@ -48,3 +50,35 @@ class DispatchStatusResponse(BaseModel):
     latest_digest_id: Optional[uuid.UUID] = None
     latest_digest_stories: int = 0
     active_daily_subscribers: int = 0
+    active_weekly_subscribers: int = 0
+    latest_delivery_at: Optional[datetime] = None
+    latest_collection_at: Optional[datetime] = None
+    news_retention_days: int = 90
+    delivery_record_retention_days: int = 180
+
+
+class ScheduledTickRequest(BaseModel):
+    """Parameters for scheduler cron execution."""
+    target_time_utc: Optional[datetime] = Field(None, description="Current simulated UTC timestamp")
+    run_pipeline: Optional[bool] = Field(None, description="Force news collection pass, or None for auto")
+    run_cleanup: Optional[bool] = Field(None, description="Force retention cleanup pass, or None for auto")
+    dry_run: bool = Field(False, description="Simulate execution without sending emails or updating state")
+    window_minutes: int = Field(60, ge=1, le=240, description="Due window minutes threshold")
+
+
+class ScheduledTickResponse(BaseModel):
+    """Telemetry outcome of a scheduled tick execution."""
+    status: str
+    execution_id: uuid.UUID
+    target_time_utc: datetime
+    collection_executed: bool = False
+    digest_compiled: bool = False
+    digest_id: Optional[uuid.UUID] = None
+    due_subscribers_count: int = 0
+    sent_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    cleanup_executed: bool = False
+    cleanup_summary: Dict[str, Any] = Field(default_factory=dict)
+    duration_seconds: float = 0.0
+    executed_at: datetime

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
@@ -43,7 +44,11 @@ class SubscriberService:
             age_group=request.age_group,
             frequency=request.frequency or "DAILY",
             preferred_channel=request.preferred_channel or "EMAIL",
+            preferred_time=request.preferred_time or "08:00",
+            timezone_str=request.timezone or "Asia/Kolkata",
+            preferred_weekday=request.preferred_weekday or "MONDAY",
             topics=request.topics or [],
+            content_preferences=request.content_preferences or {},
         )
         # CRITICAL: Commit transaction FIRST to guarantee persistence before sending email
         await self.session.commit()
@@ -51,7 +56,8 @@ class SubscriberService:
         was_reactivated = getattr(subscriber, "_was_reactivated", False)
         logger.info(
             f"Subscriber persisted: id={subscriber.id}, created={is_created}, "
-            f"reactivated={was_reactivated}, active={subscriber.is_active}"
+            f"reactivated={was_reactivated}, active={subscriber.is_active}, "
+            f"pref_time={subscriber.preferred_time}, tz={subscriber.timezone}"
         )
 
         # Dispatch welcome email ONLY for newly created or reactivated subscribers
@@ -109,7 +115,11 @@ class SubscriberService:
             age_group=request.age_group,
             frequency=request.frequency,
             preferred_channel=request.preferred_channel,
+            preferred_time=request.preferred_time,
+            timezone_str=request.timezone,
+            preferred_weekday=request.preferred_weekday,
             topics=request.topics,
+            content_preferences=request.content_preferences,
         )
         await self.session.commit()
         logger.info(f"Subscriber preferences updated: email={clean_email}")
@@ -119,6 +129,14 @@ class SubscriberService:
         """Retrieve all active subscribers scheduled for delivery."""
         return await self.repo.list_active(frequency=frequency)
 
-    async def get_active_count(self) -> int:
+    async def get_due_subscribers(
+        self,
+        target_time_utc: Optional[datetime] = None,
+        window_minutes: int = 60,
+    ) -> List[Subscriber]:
+        """Retrieve subscribers who are due for newsletter dispatch at the specified UTC time."""
+        return await self.repo.list_due_subscribers(target_time_utc=target_time_utc, window_minutes=window_minutes)
+
+    async def get_active_count(self, frequency: Optional[str] = None) -> int:
         """Count active subscribers."""
-        return await self.repo.count_active()
+        return await self.repo.count_active(frequency=frequency)
